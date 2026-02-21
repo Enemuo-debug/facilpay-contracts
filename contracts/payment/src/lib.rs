@@ -240,7 +240,8 @@ impl PaymentContract {
             payment_id,
             merchant: payment.merchant,
             amount: payment.amount,
-        };
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -277,7 +278,8 @@ impl PaymentContract {
             payment_id,
             customer: payment.customer,
             amount: payment.amount,
-        };
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -317,7 +319,8 @@ impl PaymentContract {
             payment_id,
             cancelled_by: caller,
             timestamp,
-        };
+        }
+        .publish(&env);
 
         Ok(())
     }
