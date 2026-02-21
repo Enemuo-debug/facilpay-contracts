@@ -82,7 +82,7 @@ fn test_complete_payment_success() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Complete the payment
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 
     // Verify status changed to Completed
     let payment = client.get_payment(&payment_id);
@@ -106,7 +106,7 @@ fn test_refund_payment_success() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 
     // Verify status changed to Refunded
     let payment = client.get_payment(&payment_id);
@@ -124,7 +124,7 @@ fn test_complete_payment_not_found() {
 
     env.mock_all_auths();
 
-    client.complete_payment(&admin, &999).unwrap();
+    client.complete_payment(&admin, &999);
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn test_refund_payment_not_found() {
 
     env.mock_all_auths();
 
-    client.refund_payment(&admin, &999).unwrap();
+    client.refund_payment(&admin, &999);
 }
 
 #[test]
@@ -159,10 +159,10 @@ fn test_complete_already_completed_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Complete the payment first time
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 
     // Try to complete again - should fail
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 }
 
 #[test]
@@ -183,10 +183,10 @@ fn test_refund_already_refunded_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment first time
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 
     // Try to refund again - should fail
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 }
 
 #[test]
@@ -207,10 +207,10 @@ fn test_complete_refunded_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment first
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 
     // Try to complete refunded payment - should panic due to InvalidStatus error
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 }
 
 #[test]
@@ -231,10 +231,10 @@ fn test_refund_completed_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Complete the payment first
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 
     // Try to refund completed payment - should panic due to InvalidStatus error
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn test_multiple_payments_correct_modification() {
     let payment_id2 = client.create_payment(&customer2, &merchant, &2000_i128, &token, &0);
 
     // Complete first payment
-    client.complete_payment(&admin, &payment_id1).unwrap();
+    client.complete_payment(&admin, &payment_id1);
 
     // Check both payments have correct status
     let payment1 = client.get_payment(&payment_id1);
@@ -370,7 +370,7 @@ fn test_cancel_completed_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Complete the payment first
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 
     // Try to cancel completed payment
     let result = client.try_cancel_payment(&customer, &payment_id);
@@ -395,7 +395,7 @@ fn test_cancel_refunded_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment first
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 
     // Try to cancel refunded payment
     let result = client.try_cancel_payment(&customer, &payment_id);
@@ -419,7 +419,7 @@ fn test_cancel_already_cancelled_payment() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Cancel the payment first time
-    client.cancel_payment(&customer, &payment_id).unwrap();
+    client.cancel_payment(&customer, &payment_id);
 
     // Try to cancel again
     let result = client.try_cancel_payment(&customer, &payment_id);
@@ -469,7 +469,7 @@ fn test_cancel_multiple_payments_correct_modification() {
     let payment_id2 = client.create_payment(&customer2, &merchant, &2000_i128, &token, &0);
 
     // Cancel first payment
-    client.cancel_payment(&customer1, &payment_id1).unwrap();
+    client.cancel_payment(&customer1, &payment_id1);
 
     // Check both payments have correct status
     let payment1 = client.get_payment(&payment_id1);
@@ -906,7 +906,7 @@ fn test_expire_payment_not_found() {
 
     env.mock_all_auths();
 
-    client.expire_payment(&999).unwrap();
+    client.expire_payment(&999);
 }
 
 #[test]
@@ -928,7 +928,7 @@ fn test_expire_payment_before_expiration() {
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
 
-    client.expire_payment(&payment_id).unwrap();
+    client.expire_payment(&payment_id);
 }
 
 #[test]
@@ -949,7 +949,7 @@ fn test_expire_payment_no_expiration_set() {
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
 
-    client.expire_payment(&payment_id).unwrap();
+    client.expire_payment(&payment_id);
 }
 
 #[test]
@@ -969,11 +969,11 @@ fn test_expire_completed_payment() {
     env.mock_all_auths();
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
-    client.expire_payment(&payment_id).unwrap();
+    client.expire_payment(&payment_id);
 }
 
 #[test]
@@ -993,11 +993,11 @@ fn test_expire_refunded_payment() {
     env.mock_all_auths();
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
-    client.expire_payment(&payment_id).unwrap();
+    client.expire_payment(&payment_id);
 }
 
 #[test]
@@ -1016,11 +1016,11 @@ fn test_expire_cancelled_payment() {
     env.mock_all_auths();
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
-    client.cancel_payment(&customer, &payment_id).unwrap();
+    client.cancel_payment(&customer, &payment_id);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
-    client.expire_payment(&payment_id).unwrap();
+    client.expire_payment(&payment_id);
 }
 
 #[test]
@@ -1042,7 +1042,7 @@ fn test_payment_expired_event_emitted() {
 
     env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
-    client.expire_payment(&payment_id).unwrap();
+    client.expire_payment(&payment_id);
 
     let events = env.events().all();
     assert!(!events.is_empty());
@@ -1073,7 +1073,7 @@ fn test_multiple_payments_different_expiration_times() {
     let initial_timestamp3 = env.ledger().timestamp();
 
     env.ledger().set_timestamp(initial_timestamp1 + 10 + 1);
-    client.expire_payment(&payment_id1).unwrap();
+    client.expire_payment(&payment_id1);
 
     let p1 = client.get_payment(&payment_id1);
     let p2 = client.get_payment(&payment_id2);
@@ -1084,7 +1084,7 @@ fn test_multiple_payments_different_expiration_times() {
     assert!(!client.is_payment_expired(&payment_id3));
 
     env.ledger().set_timestamp(initial_timestamp3 + 30 + 1);
-    client.expire_payment(&payment_id3).unwrap();
+    client.expire_payment(&payment_id3);
 
     let p3_after = client.get_payment(&payment_id3);
     assert_eq!(p3_after.status, PaymentStatus::Cancelled);
@@ -1111,7 +1111,7 @@ fn test_complete_expired_payment_fails() {
 
     env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
-    client.complete_payment(&admin, &payment_id).unwrap();
+    client.complete_payment(&admin, &payment_id);
 }
 
 #[test]
@@ -1134,5 +1134,5 @@ fn test_refund_expired_payment_fails() {
 
     env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
-    client.refund_payment(&admin, &payment_id).unwrap();
+    client.refund_payment(&admin, &payment_id);
 }
