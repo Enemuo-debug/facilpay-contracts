@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -31,6 +33,7 @@ pub enum Error {
     PaymentExpired = 5,
     NotExpired = 6,
     NoExpiration = 7,
+    TransferFailed = 8,
 }
 
 #[contractevent]
@@ -130,12 +133,14 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::CustomerPaymentCount(customer.clone()))
             .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::CustomerPayments(customer.clone(), customer_count), &payment_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::CustomerPaymentCount(customer), &(customer_count + 1));
+        env.storage().instance().set(
+            &DataKey::CustomerPayments(customer.clone(), customer_count),
+            &payment_id,
+        );
+        env.storage().instance().set(
+            &DataKey::CustomerPaymentCount(customer),
+            &(customer_count + 1),
+        );
 
         // Index by merchant
         let merchant_count: u64 = env
@@ -143,12 +148,14 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::MerchantPaymentCount(merchant.clone()))
             .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::MerchantPayments(merchant.clone(), merchant_count), &payment_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::MerchantPaymentCount(merchant), &(merchant_count + 1));
+        env.storage().instance().set(
+            &DataKey::MerchantPayments(merchant.clone(), merchant_count),
+            &payment_id,
+        );
+        env.storage().instance().set(
+            &DataKey::MerchantPaymentCount(merchant),
+            &(merchant_count + 1),
+        );
 
         payment_id
     }
@@ -231,6 +238,17 @@ impl PaymentContract {
             PaymentStatus::Refunded => return Err(Error::InvalidStatus),
             PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
         }
+
+        // token transfer from customer to merchant
+        let token_client = token::Client::new(&env, &payment.token);
+        let contract_address = env.current_contract_address();
+
+        token_client.transfer_from(
+            &contract_address,
+            &payment.customer,
+            &payment.merchant,
+            &payment.amount,
+        );
 
         env.storage()
             .instance()

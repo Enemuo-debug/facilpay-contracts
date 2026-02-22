@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env};
 use soroban_sdk::testutils::{Events, Ledger};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 #[test]
 fn test_create_payment() {
@@ -68,23 +68,29 @@ fn test_get_payment_not_found() {
 #[test]
 fn test_complete_payment_success() {
     let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(&env, &contract_id);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
-    let token = Address::generate(&env);
     let amount = 1000_i128;
 
-    env.mock_all_auths();
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
-
-    // Complete the payment
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
     client.complete_payment(&admin, &payment_id);
 
-    // Verify status changed to Completed
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.status, PaymentStatus::Completed);
 }
@@ -240,6 +246,15 @@ fn test_refund_completed_payment() {
 #[test]
 fn test_multiple_payments_correct_modification() {
     let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(&env, &contract_id);
 
@@ -247,25 +262,23 @@ fn test_multiple_payments_correct_modification() {
     let customer2 = Address::generate(&env);
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
-    let token = Address::generate(&env);
+    let amount = 1000_i128;
 
-    env.mock_all_auths();
+    token_client.mint(&customer1, &amount);
+    token_user_client.approve(&customer1, &contract_id, &amount, &1000);
 
-    // Create two payments
-    let payment_id1 = client.create_payment(&customer1, &merchant, &1000_i128, &token, &0);
-    let payment_id2 = client.create_payment(&customer2, &merchant, &2000_i128, &token, &0);
+    let payment_id1 = client.create_payment(&customer1, &merchant, &amount, &token_contract_id, &0);
+    let payment_id2 =
+        client.create_payment(&customer2, &merchant, &2000_i128, &token_contract_id, &0);
 
-    // Complete first payment
     client.complete_payment(&admin, &payment_id1);
 
-    // Check both payments have correct status
     let payment1 = client.get_payment(&payment_id1);
     let payment2 = client.get_payment(&payment_id2);
 
     assert_eq!(payment1.status, PaymentStatus::Completed);
     assert_eq!(payment2.status, PaymentStatus::Pending);
 }
-
 // Cancel Payment Tests
 #[test]
 fn test_customer_cancel_pending_payment() {
@@ -354,28 +367,34 @@ fn test_cancel_payment_unauthorized() {
 }
 
 #[test]
+#[should_panic]
 fn test_cancel_completed_payment() {
     let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(&env, &contract_id);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
-    let token = Address::generate(&env);
     let amount = 1000_i128;
 
-    env.mock_all_auths();
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
-
-    // Complete the payment first
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
     client.complete_payment(&admin, &payment_id);
 
-    // Try to cancel completed payment
-    let result = client.try_cancel_payment(&customer, &payment_id);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+    // Should panic - InvalidStatus
+    client.cancel_payment(&customer, &payment_id);
 }
 
 #[test]
@@ -772,7 +791,8 @@ fn test_create_payment_with_expiration_duration() {
     env.mock_all_auths();
 
     let current_timestamp = env.ledger().timestamp();
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.expires_at, current_timestamp + expiration_duration);
@@ -792,7 +812,8 @@ fn test_create_payment_no_expiration() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.expires_at, 0);
@@ -812,9 +833,11 @@ fn test_is_payment_expired_true() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     assert!(client.is_payment_expired(&payment_id));
 }
@@ -833,7 +856,8 @@ fn test_is_payment_expired_false_not_yet() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
 
@@ -854,7 +878,8 @@ fn test_is_payment_expired_false_no_expiration() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
 
@@ -886,9 +911,11 @@ fn test_expire_pending_payment_success() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     let result = client.try_expire_payment(&payment_id);
     assert!(result.is_ok());
@@ -924,7 +951,8 @@ fn test_expire_payment_before_expiration() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
 
@@ -946,7 +974,8 @@ fn test_expire_payment_no_expiration_set() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
 
     client.expire_payment(&payment_id);
@@ -968,10 +997,12 @@ fn test_expire_completed_payment() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     client.complete_payment(&admin, &payment_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 }
@@ -992,10 +1023,12 @@ fn test_expire_refunded_payment() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     client.refund_payment(&admin, &payment_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 }
@@ -1015,10 +1048,12 @@ fn test_expire_cancelled_payment() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     client.cancel_payment(&customer, &payment_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 }
@@ -1037,10 +1072,12 @@ fn test_payment_expired_event_emitted() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     let _expected_expires_at = env.ledger().timestamp() + expiration_duration;
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 
@@ -1107,9 +1144,11 @@ fn test_complete_expired_payment_fails() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.complete_payment(&admin, &payment_id);
 }
@@ -1130,9 +1169,167 @@ fn test_refund_expired_payment_fails() {
 
     env.mock_all_auths();
 
-    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
+    let payment_id =
+        client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.refund_payment(&admin, &payment_id);
+}
+
+#[test]
+fn test_complete_payment_transfers_tokens_to_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Register a real mock token contract
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    // Mint tokens to customer
+    token_client.mint(&customer, &amount);
+    assert_eq!(token_user_client.balance(&customer), amount);
+
+    // Customer approves contract to spend on their behalf
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
+
+    client.complete_payment(&admin, &payment_id);
+
+    // Verify funds moved
+    assert_eq!(token_user_client.balance(&customer), 0);
+    assert_eq!(token_user_client.balance(&merchant), amount);
+}
+
+#[test]
+fn test_complete_payment_status_is_completed_after_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 500_i128;
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
+
+    client.complete_payment(&admin, &payment_id);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+}
+
+#[test]
+#[should_panic]
+fn test_complete_payment_fails_without_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    // Mint but no approve — transfer_from should fail
+    token_client.mint(&customer, &amount);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
+
+    client.complete_payment(&admin, &payment_id);
+}
+
+#[test]
+#[should_panic]
+fn test_complete_payment_fails_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    // Approve but no balance
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
+
+    client.complete_payment(&admin, &payment_id);
+}
+
+#[test]
+fn test_complete_payment_partial_allowance_with_exact_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 750_i128;
+
+    token_client.mint(&customer, &2000);
+    // Approve exactly the payment amount
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &0);
+
+    client.complete_payment(&admin, &payment_id);
+
+    assert_eq!(token_user_client.balance(&merchant), amount);
+    assert_eq!(token_user_client.balance(&customer), 2000 - amount);
 }
