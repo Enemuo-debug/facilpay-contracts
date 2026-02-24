@@ -85,6 +85,8 @@ fn test_complete_payment_success() {
     let admin = Address::generate(&env);
     let amount = 1000_i128;
 
+    client.initialize(&admin);
+
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &1000);
 
@@ -109,6 +111,8 @@ fn test_refund_payment_success() {
 
     env.mock_all_auths();
 
+    client.initialize(&admin);
+
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment
@@ -130,6 +134,8 @@ fn test_complete_payment_not_found() {
 
     env.mock_all_auths();
 
+    client.initialize(&admin);
+
     client.complete_payment(&admin, &999);
 }
 
@@ -143,6 +149,8 @@ fn test_refund_payment_not_found() {
     let admin = Address::generate(&env);
 
     env.mock_all_auths();
+
+    client.initialize(&admin);
 
     client.refund_payment(&admin, &999);
 }
@@ -161,6 +169,8 @@ fn test_complete_already_completed_payment() {
     let amount = 1000_i128;
 
     env.mock_all_auths();
+
+    client.initialize(&admin);
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
@@ -186,6 +196,8 @@ fn test_refund_already_refunded_payment() {
 
     env.mock_all_auths();
 
+    client.initialize(&admin);
+
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment first time
@@ -210,6 +222,8 @@ fn test_complete_refunded_payment() {
 
     env.mock_all_auths();
 
+    client.initialize(&admin);
+
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
     // Refund the payment first
@@ -233,6 +247,8 @@ fn test_refund_completed_payment() {
     let amount = 2000_i128;
 
     env.mock_all_auths();
+
+    client.initialize(&admin);
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
@@ -263,6 +279,8 @@ fn test_multiple_payments_correct_modification() {
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
     let amount = 1000_i128;
+
+    client.initialize(&admin);
 
     token_client.mint(&customer1, &amount);
     token_user_client.approve(&customer1, &contract_id, &amount, &1000);
@@ -387,6 +405,8 @@ fn test_cancel_completed_payment() {
     let admin = Address::generate(&env);
     let amount = 1000_i128;
 
+    client.initialize(&admin);
+
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &1000);
 
@@ -410,6 +430,8 @@ fn test_cancel_refunded_payment() {
     let amount = 1000_i128;
 
     env.mock_all_auths();
+
+    client.initialize(&admin);
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
 
@@ -997,6 +1019,8 @@ fn test_expire_completed_payment() {
 
     env.mock_all_auths();
 
+    client.initialize(&admin);
+
     let payment_id =
         client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
     client.complete_payment(&admin, &payment_id);
@@ -1022,6 +1046,8 @@ fn test_expire_refunded_payment() {
     let expiration_duration = 10_u64;
 
     env.mock_all_auths();
+
+    client.initialize(&admin);
 
     let payment_id =
         client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
@@ -1144,6 +1170,8 @@ fn test_complete_expired_payment_fails() {
 
     env.mock_all_auths();
 
+    client.initialize(&admin);
+
     let payment_id =
         client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
 
@@ -1168,6 +1196,8 @@ fn test_refund_expired_payment_fails() {
     let expiration_duration = 10_u64;
 
     env.mock_all_auths();
+
+    client.initialize(&admin);
 
     let payment_id =
         client.create_payment(&customer, &merchant, &amount, &token, &expiration_duration);
@@ -1198,6 +1228,8 @@ fn test_complete_payment_transfers_tokens_to_merchant() {
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
     let amount = 1000_i128;
+
+    client.initialize(&admin);
 
     // Mint tokens to customer
     token_client.mint(&customer, &amount);
@@ -1235,6 +1267,8 @@ fn test_complete_payment_status_is_completed_after_transfer() {
     let admin = Address::generate(&env);
     let amount = 500_i128;
 
+    client.initialize(&admin);
+
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &1000);
 
@@ -1266,6 +1300,8 @@ fn test_complete_payment_fails_without_allowance() {
     let admin = Address::generate(&env);
     let amount = 1000_i128;
 
+    client.initialize(&admin);
+
     // Mint but no approve — transfer_from should fail
     token_client.mint(&customer, &amount);
 
@@ -1293,6 +1329,8 @@ fn test_complete_payment_fails_insufficient_balance() {
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
     let amount = 1000_i128;
+
+    client.initialize(&admin);
 
     // Approve but no balance
     token_user_client.approve(&customer, &contract_id, &amount, &1000);
@@ -1322,6 +1360,8 @@ fn test_complete_payment_partial_allowance_with_exact_amount() {
     let admin = Address::generate(&env);
     let amount = 750_i128;
 
+    client.initialize(&admin);
+
     token_client.mint(&customer, &2000);
     // Approve exactly the payment amount
     token_user_client.approve(&customer, &contract_id, &amount, &1000);
@@ -1332,4 +1372,71 @@ fn test_complete_payment_partial_allowance_with_exact_amount() {
 
     assert_eq!(token_user_client.balance(&merchant), amount);
     assert_eq!(token_user_client.balance(&customer), 2000 - amount);
+}
+
+// --------------------------------------------------------------------------------
+// Initialization & Admin Authorization Logic
+// --------------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_initialize_already_initialized() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    // Panic here on the second call
+    client.initialize(&admin);
+}
+
+#[test]
+fn test_complete_payment_unauthorized_admin() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let real_admin = Address::generate(&env);
+    let fake_admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&real_admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
+
+    // Try to complete with fake_admin, should return Error::Unauthorized
+    let result = client.try_complete_payment(&fake_admin, &payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+}
+
+#[test]
+fn test_refund_payment_unauthorized_admin() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let real_admin = Address::generate(&env);
+    let fake_admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&real_admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &0);
+
+    // Try to refund with fake_admin, should return Error::Unauthorized
+    let result = client.try_refund_payment(&fake_admin, &payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
 }
