@@ -6,6 +6,7 @@ use soroban_sdk::{
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    Admin,
     Payment(u64),
     PaymentCounter,
     CustomerPayments(Address, u64),
@@ -94,6 +95,13 @@ const MAX_NOTES_SIZE: u32 = 1024;
 
 #[contractimpl]
 impl PaymentContract {
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
     pub fn create_payment(
         env: Env,
         customer: Address,
@@ -271,6 +279,16 @@ impl PaymentContract {
     pub fn complete_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
+        // Verify caller is the legitimate admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
         // Check if payment exists
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
             return Err(Error::PaymentNotFound);
@@ -319,6 +337,16 @@ impl PaymentContract {
 
     pub fn refund_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
         admin.require_auth();
+
+        // Verify caller is the legitimate admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
 
         // Check if payment exists
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
