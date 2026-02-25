@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String, Vec,
 };
 
 #[derive(Clone)]
@@ -13,6 +13,7 @@ pub enum DataKey {
     MerchantPayments(Address, u64),
     CustomerPaymentCount(Address),
     MerchantPaymentCount(Address),
+    PaymentNotes(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +36,8 @@ pub enum Error {
     NotExpired = 6,
     NoExpiration = 7,
     TransferFailed = 8,
+    MetadataTooLarge = 9,
+    NotesTooLarge = 10,
 }
 
 #[contractevent]
@@ -79,10 +82,16 @@ pub struct Payment {
     pub status: PaymentStatus,
     pub created_at: u64,
     pub expires_at: u64,
+    pub metadata: String,
+    pub notes: String,
 }
 
 #[contract]
 pub struct PaymentContract;
+
+// Constants for size limits
+const MAX_METADATA_SIZE: u32 = 512;
+const MAX_NOTES_SIZE: u32 = 1024;
 
 #[contractimpl]
 impl PaymentContract {
@@ -100,8 +109,14 @@ impl PaymentContract {
         amount: i128,
         token: Address,
         expiration_duration: u64,
-    ) -> u64 {
+        metadata: String,
+    ) -> Result<u64, Error> {
         customer.require_auth();
+
+        // Validate metadata size
+        if metadata.len() > MAX_METADATA_SIZE {
+            return Err(Error::MetadataTooLarge);
+        }
 
         let counter: u64 = env
             .storage()
@@ -126,6 +141,8 @@ impl PaymentContract {
             status: PaymentStatus::Pending,
             created_at: current_timestamp,
             expires_at,
+            metadata,
+            notes: String::from_str(&env, ""),
         };
 
         env.storage()
@@ -165,7 +182,7 @@ impl PaymentContract {
             &(merchant_count + 1),
         );
 
-        payment_id
+        Ok(payment_id)
     }
 
     pub fn get_payment(env: &Env, payment_id: u64) -> Payment {
@@ -173,6 +190,42 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Payment(payment_id))
             .expect("Payment not found")
+    }
+
+    pub fn update_payment_notes(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        notes: String,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        // Validate notes size
+        if notes.len() > MAX_NOTES_SIZE {
+            return Err(Error::NotesTooLarge);
+        }
+
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Verify caller is the merchant
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Update notes
+        payment.notes = notes;
+
+        // Save updated payment
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        Ok(())
     }
 
     pub fn is_payment_expired(env: &Env, payment_id: u64) -> bool {
