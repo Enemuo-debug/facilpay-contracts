@@ -1,7 +1,15 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env,
-    String, Vec,
+    contract,
+    contracterror,
+    contractevent,
+    contractimpl,
+    contracttype,
+    token,
+    Address,
+    Env,
+    String,
+    Vec,
 };
 use escrow::EscrowContractClient;
 
@@ -25,6 +33,8 @@ pub enum DataKey {
     MerchantSubscriptionCount(Address),
     RateLimitConfig,
     AddressRateLimit(Address),
+    DunningConfig,
+    DunningState(u64),
     EscrowedPayment(u64),
 }
 
@@ -55,6 +65,8 @@ pub enum SubscriptionStatus {
     Paused,
     Cancelled,
     Expired,
+    InDunning,
+    Suspended,
 }
 
 #[derive(Clone)]
@@ -71,10 +83,10 @@ pub struct Subscription {
     pub status: SubscriptionStatus,
     pub created_at: u64,
     pub next_payment_at: u64,
-    pub ends_at: u64,       // 0 = no hard end
+    pub ends_at: u64, // 0 = no hard end
     pub payment_count: u64, // successful executions so far
-    pub retry_count: u64,   // consecutive failed attempts on current cycle
-    pub max_retries: u64,   // max retries before marking failed cycle skipped
+    pub retry_count: u64, // consecutive failed attempts on current cycle
+    pub max_retries: u64, // max retries before marking failed cycle skipped
     pub metadata: String,
 }
 
@@ -102,6 +114,10 @@ pub enum Error {
     DailyVolumeExceeded = 21,
     AddressFlagged = 22,
     AmountExceedsLimit = 23,
+    DunningNotFound = 24,
+    SubscriptionNotInDunning = 25,
+    RetryNotDue = 26,
+    GracePeriodExpired = 27,
     EscrowMappingNotFound = 24,
     EscrowBridgeFailed = 25,
 }
@@ -234,6 +250,35 @@ pub struct RateLimitBreached {
     pub payment_count: u32,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionEnteredDunning {
+    pub subscription_id: u64,
+    pub attempt: u32,
+    pub next_retry_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DunningRetryScheduled {
+    pub subscription_id: u64,
+    pub retry_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionSuspended {
+    pub subscription_id: u64,
+    pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DunningResolved {
+    pub subscription_id: u64,
+    pub admin: Address,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct RateLimitConfig {
@@ -252,6 +297,26 @@ pub struct AddressRateLimit {
     pub daily_volume: i128,
     pub last_payment_at: u64,
     pub flagged: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DunningConfig {
+    pub grace_period: u64,
+    pub retry_intervals: Vec<u64>,
+    pub max_dunning_attempts: u32,
+    pub suspend_after_attempts: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DunningState {
+    pub subscription_id: u64,
+    pub attempts: u32,
+    pub next_retry_at: u64,
+    pub grace_period_ends_at: u64,
+    pub suspended: bool,
+    pub last_failure_reason: String,
 }
 
 #[derive(Clone)]
@@ -306,7 +371,7 @@ impl PaymentContract {
         token: Address,
         currency: Currency,
         expiration_duration: u64,
-        metadata: String,
+        metadata: String
     ) -> Result<u64, Error> {
         customer.require_auth();
 
@@ -323,11 +388,7 @@ impl PaymentContract {
         // Check rate limits and anti-fraud before processing
         PaymentContract::check_rate_limit(&env, &customer, amount)?;
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PaymentCounter)
-            .unwrap_or(0);
+        let counter: u64 = env.storage().instance().get(&DataKey::PaymentCounter).unwrap_or(0);
         let payment_id = counter + 1;
 
         let current_timestamp = env.ledger().timestamp();
@@ -352,12 +413,8 @@ impl PaymentContract {
             refunded_amount: 0,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
-        env.storage()
-            .instance()
-            .set(&DataKey::PaymentCounter, &payment_id);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::PaymentCounter, &payment_id);
 
         // Index by customer
         let customer_count: u64 = env
@@ -365,14 +422,12 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::CustomerPaymentCount(customer.clone()))
             .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::CustomerPayments(customer.clone(), customer_count),
-            &payment_id,
-        );
-        env.storage().instance().set(
-            &DataKey::CustomerPaymentCount(customer),
-            &(customer_count + 1),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerPayments(customer.clone(), customer_count), &payment_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerPaymentCount(customer), &(customer_count + 1));
 
         // Index by merchant
         let merchant_count: u64 = env
@@ -380,14 +435,12 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::MerchantPaymentCount(merchant.clone()))
             .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::MerchantPayments(merchant.clone(), merchant_count),
-            &payment_id,
-        );
-        env.storage().instance().set(
-            &DataKey::MerchantPaymentCount(merchant),
-            &(merchant_count + 1),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantPayments(merchant.clone(), merchant_count), &payment_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantPaymentCount(merchant), &(merchant_count + 1));
 
         PaymentCreated {
             payment_id,
@@ -401,10 +454,7 @@ impl PaymentContract {
     }
 
     pub fn get_payment(env: &Env, payment_id: u64) -> Payment {
-        env.storage()
-            .instance()
-            .get(&DataKey::Payment(payment_id))
-            .expect("Payment not found")
+        env.storage().instance().get(&DataKey::Payment(payment_id)).expect("Payment not found")
     }
 
     pub fn create_escrowed_payment(
@@ -555,7 +605,7 @@ impl PaymentContract {
         env: Env,
         merchant: Address,
         payment_id: u64,
-        notes: String,
+        notes: String
     ) -> Result<(), Error> {
         merchant.require_auth();
 
@@ -580,9 +630,7 @@ impl PaymentContract {
         payment.notes = notes;
 
         // Save updated payment
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
         Ok(())
     }
@@ -621,16 +669,13 @@ impl PaymentContract {
         payment.status = PaymentStatus::Cancelled;
 
         // Store updated payment back to storage
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
         // Emit PaymentExpired event
-        PaymentExpired {
+        (PaymentExpired {
             payment_id,
             expiration_timestamp: payment.expires_at,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -664,9 +709,15 @@ impl PaymentContract {
             PaymentStatus::Pending => {
                 payment.status = PaymentStatus::Completed;
             }
-            PaymentStatus::Completed => return Err(Error::AlreadyProcessed),
-            PaymentStatus::Refunded | PaymentStatus::PartialRefunded => return Err(Error::InvalidStatus),
-            PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
+            PaymentStatus::Completed => {
+                return Err(Error::AlreadyProcessed);
+            }
+            PaymentStatus::Refunded | PaymentStatus::PartialRefunded => {
+                return Err(Error::InvalidStatus);
+            }
+            PaymentStatus::Cancelled => {
+                return Err(Error::InvalidStatus);
+            }
         }
 
         // token transfer from customer to merchant
@@ -677,19 +728,16 @@ impl PaymentContract {
             &contract_address,
             &payment.customer,
             &payment.merchant,
-            &payment.amount,
+            &payment.amount
         );
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
-        PaymentCompleted {
+        (PaymentCompleted {
             payment_id,
             merchant: payment.merchant,
             amount: payment.amount,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -723,21 +771,24 @@ impl PaymentContract {
             PaymentStatus::Pending => {
                 payment.status = PaymentStatus::Refunded;
             }
-            PaymentStatus::Completed | PaymentStatus::PartialRefunded => return Err(Error::InvalidStatus),
-            PaymentStatus::Refunded => return Err(Error::AlreadyProcessed),
-            PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
+            PaymentStatus::Completed | PaymentStatus::PartialRefunded => {
+                return Err(Error::InvalidStatus);
+            }
+            PaymentStatus::Refunded => {
+                return Err(Error::AlreadyProcessed);
+            }
+            PaymentStatus::Cancelled => {
+                return Err(Error::InvalidStatus);
+            }
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
-        PaymentRefunded {
+        (PaymentRefunded {
             payment_id,
             customer: payment.customer,
             amount: payment.amount,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -746,7 +797,7 @@ impl PaymentContract {
         env: Env,
         admin: Address,
         payment_id: u64,
-        refund_amount: i128,
+        refund_amount: i128
     ) -> Result<(), Error> {
         admin.require_auth();
 
@@ -782,19 +833,18 @@ impl PaymentContract {
                     PaymentStatus::PartialRefunded
                 };
             }
-            _ => return Err(Error::InvalidStatus),
+            _ => {
+                return Err(Error::InvalidStatus);
+            }
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
-        PaymentRefunded {
+        (PaymentRefunded {
             payment_id,
             customer: payment.customer,
             amount: refund_amount,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -820,20 +870,22 @@ impl PaymentContract {
             PaymentStatus::Pending => {
                 payment.status = PaymentStatus::Cancelled;
             }
-            PaymentStatus::Completed | PaymentStatus::Refunded | PaymentStatus::PartialRefunded | PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
+            | PaymentStatus::Completed
+            | PaymentStatus::Refunded
+            | PaymentStatus::PartialRefunded
+            | PaymentStatus::Cancelled => {
+                return Err(Error::InvalidStatus);
+            }
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
         let timestamp = env.ledger().timestamp();
-        PaymentCancelled {
+        (PaymentCancelled {
             payment_id,
             cancelled_by: caller,
             timestamp,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -842,7 +894,7 @@ impl PaymentContract {
         env: Env,
         customer: Address,
         limit: u64,
-        offset: u64,
+        offset: u64
     ) -> Vec<Payment> {
         let total_count: u64 = env
             .storage()
@@ -855,15 +907,17 @@ impl PaymentContract {
         let end = (offset + limit).min(total_count);
 
         for i in start..end {
-            if let Some(payment_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::CustomerPayments(customer.clone(), i))
-            {
-                if let Some(payment) = env
+            if
+                let Some(payment_id) = env
                     .storage()
                     .instance()
-                    .get::<DataKey, Payment>(&DataKey::Payment(payment_id))
+                    .get::<DataKey, u64>(&DataKey::CustomerPayments(customer.clone(), i))
+            {
+                if
+                    let Some(payment) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Payment>(&DataKey::Payment(payment_id))
                 {
                     payments.push_back(payment);
                 }
@@ -874,17 +928,14 @@ impl PaymentContract {
     }
 
     pub fn get_payment_count_by_customer(env: Env, customer: Address) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CustomerPaymentCount(customer))
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::CustomerPaymentCount(customer)).unwrap_or(0)
     }
 
     pub fn get_payments_by_merchant(
         env: Env,
         merchant: Address,
         limit: u64,
-        offset: u64,
+        offset: u64
     ) -> Vec<Payment> {
         let total_count: u64 = env
             .storage()
@@ -897,15 +948,17 @@ impl PaymentContract {
         let end = (offset + limit).min(total_count);
 
         for i in start..end {
-            if let Some(payment_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::MerchantPayments(merchant.clone(), i))
-            {
-                if let Some(payment) = env
+            if
+                let Some(payment_id) = env
                     .storage()
                     .instance()
-                    .get::<DataKey, Payment>(&DataKey::Payment(payment_id))
+                    .get::<DataKey, u64>(&DataKey::MerchantPayments(merchant.clone(), i))
+            {
+                if
+                    let Some(payment) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Payment>(&DataKey::Payment(payment_id))
                 {
                     payments.push_back(payment);
                 }
@@ -916,10 +969,7 @@ impl PaymentContract {
     }
 
     pub fn get_payment_count_by_merchant(env: Env, merchant: Address) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MerchantPaymentCount(merchant))
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::MerchantPaymentCount(merchant)).unwrap_or(0)
     }
 
     fn is_valid_currency(currency: &Currency) -> bool {
@@ -933,7 +983,7 @@ impl PaymentContract {
         env: Env,
         admin: Address,
         currency: Currency,
-        rate: i128,
+        rate: i128
     ) -> Result<(), Error> {
         admin.require_auth();
 
@@ -950,18 +1000,13 @@ impl PaymentContract {
             return Err(Error::InvalidCurrency);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::ConversionRate(currency), &rate);
+        env.storage().instance().set(&DataKey::ConversionRate(currency), &rate);
 
         Ok(())
     }
 
     pub fn get_conversion_rate(env: Env, currency: Currency) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ConversionRate(currency))
-            .unwrap_or(1_0000000)
+        env.storage().instance().get(&DataKey::ConversionRate(currency)).unwrap_or(1_0000000)
     }
 
     // ── RECURRING / SUBSCRIPTION METHODS ────────────────────────────────────
@@ -980,7 +1025,7 @@ impl PaymentContract {
         interval: u64,
         duration: u64,
         max_retries: u64,
-        metadata: String,
+        metadata: String
     ) -> Result<u64, Error> {
         customer.require_auth();
 
@@ -991,20 +1036,12 @@ impl PaymentContract {
             return Err(Error::MetadataTooLarge);
         }
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SubscriptionCounter)
-            .unwrap_or(0);
+        let counter: u64 = env.storage().instance().get(&DataKey::SubscriptionCounter).unwrap_or(0);
         let sub_id = counter + 1;
 
         let now = env.ledger().timestamp();
         let ends_at = if duration > 0 { now + duration } else { 0 };
-        let retries = if max_retries == 0 {
-            DEFAULT_MAX_RETRIES
-        } else {
-            max_retries
-        };
+        let retries = if max_retries == 0 { DEFAULT_MAX_RETRIES } else { max_retries };
 
         let sub = Subscription {
             id: sub_id,
@@ -1025,12 +1062,8 @@ impl PaymentContract {
             metadata,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(sub_id), &sub);
-        env.storage()
-            .instance()
-            .set(&DataKey::SubscriptionCounter, &sub_id);
+        env.storage().instance().set(&DataKey::Subscription(sub_id), &sub);
+        env.storage().instance().set(&DataKey::SubscriptionCounter, &sub_id);
 
         // Index by customer
         let c_count: u64 = env
@@ -1038,14 +1071,12 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::CustomerSubscriptionCount(customer.clone()))
             .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::CustomerSubscriptions(customer.clone(), c_count),
-            &sub_id,
-        );
-        env.storage().instance().set(
-            &DataKey::CustomerSubscriptionCount(customer),
-            &(c_count + 1),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerSubscriptions(customer.clone(), c_count), &sub_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerSubscriptionCount(customer), &(c_count + 1));
 
         // Index by merchant
         let m_count: u64 = env
@@ -1053,23 +1084,20 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::MerchantSubscriptionCount(merchant.clone()))
             .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::MerchantSubscriptions(merchant.clone(), m_count),
-            &sub_id,
-        );
-        env.storage().instance().set(
-            &DataKey::MerchantSubscriptionCount(merchant.clone()),
-            &(m_count + 1),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantSubscriptions(merchant.clone(), m_count), &sub_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantSubscriptionCount(merchant.clone()), &(m_count + 1));
 
-        SubscriptionCreated {
+        (SubscriptionCreated {
             subscription_id: sub_id,
             customer: sub.customer.clone(),
             merchant: sub.merchant.clone(),
             amount: sub.amount,
             interval: sub.interval,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(sub_id)
     }
@@ -1078,11 +1106,7 @@ impl PaymentContract {
     /// Anyone (typically an off-chain keeper / cron) may call this once the
     /// payment is due. It handles retry logic internally.
     pub fn execute_recurring_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Subscription(subscription_id))
-        {
+        if !env.storage().instance().has(&DataKey::Subscription(subscription_id)) {
             return Err(Error::SubscriptionNotFound);
         }
 
@@ -1102,9 +1126,7 @@ impl PaymentContract {
         // Check subscription has not ended
         if sub.ends_at > 0 && now >= sub.ends_at {
             sub.status = SubscriptionStatus::Expired;
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &sub);
+            env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
             return Err(Error::SubscriptionEnded);
         }
 
@@ -1131,39 +1153,27 @@ impl PaymentContract {
                 sub.status = SubscriptionStatus::Expired;
             }
 
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &sub);
+            env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
 
-            RecurringPaymentExecuted {
+            (RecurringPaymentExecuted {
                 subscription_id,
                 payment_count: sub.payment_count,
                 amount: sub.amount,
                 next_payment_at: sub.next_payment_at,
-            }
-            .publish(&env);
+            }).publish(&env);
         } else {
-            // Failed payment — apply retry logic
-            sub.retry_count += 1;
-
-            RecurringPaymentFailed {
+            // Failed payment — enter dunning instead of immediate cancellation
+            PaymentContract::enter_dunning(
+                &env,
                 subscription_id,
-                retry_count: sub.retry_count,
-            }
-            .publish(&env);
+                String::from_str(&env, "Payment transfer failed")
+            );
 
-            if sub.retry_count >= sub.max_retries {
-                // Exhausted retries: cancel subscription
-                sub.status = SubscriptionStatus::Cancelled;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &sub);
-                return Err(Error::MaxRetriesExceeded);
-            }
+            (RecurringPaymentFailed {
+                subscription_id,
+                retry_count: sub.retry_count + 1,
+            }).publish(&env);
 
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &sub);
             return Err(Error::TransferFailed);
         }
 
@@ -1174,15 +1184,11 @@ impl PaymentContract {
     pub fn cancel_subscription(
         env: Env,
         caller: Address,
-        subscription_id: u64,
+        subscription_id: u64
     ) -> Result<(), Error> {
         caller.require_auth();
 
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Subscription(subscription_id))
-        {
+        if !env.storage().instance().has(&DataKey::Subscription(subscription_id)) {
             return Err(Error::SubscriptionNotFound);
         }
 
@@ -1194,29 +1200,26 @@ impl PaymentContract {
 
         let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
 
-        let is_authorized = sub.customer == caller
-            || sub.merchant == caller
-            || stored_admin.map_or(false, |a| a == caller);
+        let is_authorized =
+            sub.customer == caller ||
+            sub.merchant == caller ||
+            stored_admin.map_or(false, |a| a == caller);
 
         if !is_authorized {
             return Err(Error::Unauthorized);
         }
 
-        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
-        {
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired {
             return Err(Error::InvalidStatus);
         }
 
         sub.status = SubscriptionStatus::Cancelled;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &sub);
+        env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
 
-        SubscriptionCancelled {
+        (SubscriptionCancelled {
             subscription_id,
             cancelled_by: caller,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -1225,15 +1228,11 @@ impl PaymentContract {
     pub fn pause_subscription(
         env: Env,
         customer: Address,
-        subscription_id: u64,
+        subscription_id: u64
     ) -> Result<(), Error> {
         customer.require_auth();
 
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Subscription(subscription_id))
-        {
+        if !env.storage().instance().has(&DataKey::Subscription(subscription_id)) {
             return Err(Error::SubscriptionNotFound);
         }
 
@@ -1252,11 +1251,9 @@ impl PaymentContract {
         }
 
         sub.status = SubscriptionStatus::Paused;
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &sub);
+        env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
 
-        SubscriptionPaused { subscription_id }.publish(&env);
+        (SubscriptionPaused { subscription_id }).publish(&env);
 
         Ok(())
     }
@@ -1265,15 +1262,11 @@ impl PaymentContract {
     pub fn resume_subscription(
         env: Env,
         customer: Address,
-        subscription_id: u64,
+        subscription_id: u64
     ) -> Result<(), Error> {
         customer.require_auth();
 
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Subscription(subscription_id))
-        {
+        if !env.storage().instance().has(&DataKey::Subscription(subscription_id)) {
             return Err(Error::SubscriptionNotFound);
         }
 
@@ -1295,15 +1288,12 @@ impl PaymentContract {
         sub.next_payment_at = now + sub.interval;
         sub.status = SubscriptionStatus::Active;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(subscription_id), &sub);
+        env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
 
-        SubscriptionResumed {
+        (SubscriptionResumed {
             subscription_id,
             next_payment_at: sub.next_payment_at,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
@@ -1321,7 +1311,7 @@ impl PaymentContract {
         env: Env,
         customer: Address,
         limit: u64,
-        offset: u64,
+        offset: u64
     ) -> Vec<Subscription> {
         let total: u64 = env
             .storage()
@@ -1333,15 +1323,17 @@ impl PaymentContract {
         let end = (offset + limit).min(total);
 
         for i in offset..end {
-            if let Some(sub_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::CustomerSubscriptions(customer.clone(), i))
-            {
-                if let Some(sub) = env
+            if
+                let Some(sub_id) = env
                     .storage()
                     .instance()
-                    .get::<DataKey, Subscription>(&DataKey::Subscription(sub_id))
+                    .get::<DataKey, u64>(&DataKey::CustomerSubscriptions(customer.clone(), i))
+            {
+                if
+                    let Some(sub) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Subscription>(&DataKey::Subscription(sub_id))
                 {
                     result.push_back(sub);
                 }
@@ -1356,7 +1348,7 @@ impl PaymentContract {
         env: Env,
         merchant: Address,
         limit: u64,
-        offset: u64,
+        offset: u64
     ) -> Vec<Subscription> {
         let total: u64 = env
             .storage()
@@ -1368,15 +1360,17 @@ impl PaymentContract {
         let end = (offset + limit).min(total);
 
         for i in offset..end {
-            if let Some(sub_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::MerchantSubscriptions(merchant.clone(), i))
-            {
-                if let Some(sub) = env
+            if
+                let Some(sub_id) = env
                     .storage()
                     .instance()
-                    .get::<DataKey, Subscription>(&DataKey::Subscription(sub_id))
+                    .get::<DataKey, u64>(&DataKey::MerchantSubscriptions(merchant.clone(), i))
+            {
+                if
+                    let Some(sub) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Subscription>(&DataKey::Subscription(sub_id))
                 {
                     result.push_back(sub);
                 }
@@ -1386,13 +1380,279 @@ impl PaymentContract {
         result
     }
 
+    // ── DUNNING MANAGEMENT METHODS ─────────────────────────────────────
+
+    /// Admin sets the dunning configuration for the contract.
+    pub fn set_dunning_config(
+        env: Env,
+        admin: Address,
+        config: DunningConfig
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage().instance().set(&DataKey::DunningConfig, &config);
+
+        Ok(())
+    }
+
+    /// Returns the current dunning configuration.
+    /// Returns default config if not yet set.
+    pub fn get_dunning_config(env: Env) -> DunningConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::DunningConfig)
+            .unwrap_or(DunningConfig {
+                grace_period: 7 * 24 * 60 * 60, // 7 days
+                retry_intervals: Vec::from_array(&env, [
+                    60 * 60, // 1 hour
+                    6 * 60 * 60, // 6 hours
+                    24 * 60 * 60, // 1 day
+                    3 * 24 * 60 * 60, // 3 days
+                ]),
+                max_dunning_attempts: 5,
+                suspend_after_attempts: 4,
+            })
+    }
+
+    /// Returns the dunning state for a subscription, if any.
+    pub fn get_dunning_state(env: Env, subscription_id: u64) -> Option<DunningState> {
+        env.storage().instance().get(&DataKey::DunningState(subscription_id))
+    }
+
+    /// Retry a failed payment for a subscription in dunning.
+    /// Validates that the retry is due before attempting.
+    pub fn retry_failed_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Subscription(subscription_id)) {
+            return Err(Error::SubscriptionNotFound);
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(subscription_id))
+            .unwrap();
+
+        if sub.status != SubscriptionStatus::InDunning {
+            return Err(Error::SubscriptionNotInDunning);
+        }
+
+        let mut dunning_state: DunningState = env
+            .storage()
+            .instance()
+            .get(&DataKey::DunningState(subscription_id))
+            .ok_or(Error::DunningNotFound)?;
+
+        let now = env.ledger().timestamp();
+
+        // Check if retry is due
+        if now < dunning_state.next_retry_at {
+            return Err(Error::RetryNotDue);
+        }
+
+        // Check if grace period has expired
+        if now > dunning_state.grace_period_ends_at {
+            // Move to suspended state
+            sub.status = SubscriptionStatus::Suspended;
+            dunning_state.suspended = true;
+
+            env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
+            env.storage().instance().set(&DataKey::DunningState(subscription_id), &dunning_state);
+
+            (SubscriptionSuspended {
+                subscription_id,
+                reason: String::from_str(&env, "Grace period expired"),
+            }).publish(&env);
+
+            return Err(Error::GracePeriodExpired);
+        }
+
+        // Attempt the payment
+        let token_client = token::Client::new(&env, &sub.token);
+        let contract_address = env.current_contract_address();
+
+        let transfer_ok = token_client
+            .try_transfer_from(&contract_address, &sub.customer, &sub.merchant, &sub.amount)
+            .is_ok();
+
+        if transfer_ok {
+            // Payment successful - resolve dunning
+            sub.payment_count += 1;
+            sub.retry_count = 0;
+            sub.next_payment_at = now + sub.interval;
+            sub.status = SubscriptionStatus::Active;
+
+            // Auto-expire when duration is reached
+            if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
+                sub.status = SubscriptionStatus::Expired;
+            }
+
+            env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
+
+            // Remove dunning state
+            env.storage().instance().remove(&DataKey::DunningState(subscription_id));
+
+            (RecurringPaymentExecuted {
+                subscription_id,
+                payment_count: sub.payment_count,
+                amount: sub.amount,
+                next_payment_at: sub.next_payment_at,
+            }).publish(&env);
+
+            Ok(())
+        } else {
+            // Payment failed - update dunning state
+            dunning_state.attempts += 1;
+
+            let config = PaymentContract::get_dunning_config(env.clone());
+
+            if dunning_state.attempts >= config.max_dunning_attempts {
+                // Max attempts reached - suspend subscription
+                sub.status = SubscriptionStatus::Suspended;
+                dunning_state.suspended = true;
+
+                env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::DunningState(subscription_id), &dunning_state);
+
+                (SubscriptionSuspended {
+                    subscription_id,
+                    reason: String::from_str(&env, "Maximum dunning attempts exceeded"),
+                }).publish(&env);
+
+                return Err(Error::MaxRetriesExceeded);
+            } else if dunning_state.attempts >= config.suspend_after_attempts {
+                // Suspend after configured attempts
+                sub.status = SubscriptionStatus::Suspended;
+                dunning_state.suspended = true;
+
+                env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::DunningState(subscription_id), &dunning_state);
+
+                (SubscriptionSuspended {
+                    subscription_id,
+                    reason: String::from_str(&env, "Suspend threshold reached"),
+                }).publish(&env);
+
+                (DunningRetryScheduled {
+                    subscription_id,
+                    retry_at: dunning_state.next_retry_at,
+                }).publish(&env);
+
+                return Err(Error::TransferFailed);
+            } else {
+                // This should not happen, but handle gracefully
+                return Err(Error::TransferFailed);
+            }
+        }
+    }
+
+    /// Admin resolves dunning for a subscription, returning it to active state.
+    pub fn resolve_dunning(env: Env, admin: Address, subscription_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if !env.storage().instance().has(&DataKey::Subscription(subscription_id)) {
+            return Err(Error::SubscriptionNotFound);
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(subscription_id))
+            .unwrap();
+
+        if
+            sub.status != SubscriptionStatus::InDunning &&
+            sub.status != SubscriptionStatus::Suspended
+        {
+            return Err(Error::SubscriptionNotInDunning);
+        }
+
+        // Reset to active state
+        sub.status = SubscriptionStatus::Active;
+        sub.retry_count = 0;
+        sub.next_payment_at = env.ledger().timestamp() + sub.interval;
+
+        env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
+
+        // Remove dunning state
+        env.storage().instance().remove(&DataKey::DunningState(subscription_id));
+
+        (DunningResolved {
+            subscription_id,
+            admin,
+        }).publish(&env);
+
+        Ok(())
+    }
+
+    /// Internal function to enter dunning for a subscription.
+    fn enter_dunning(env: &Env, subscription_id: u64, reason: String) {
+        let config = PaymentContract::get_dunning_config(env.clone());
+        let now = env.ledger().timestamp();
+
+        let first_interval = if config.retry_intervals.len() > 0 {
+            config.retry_intervals.get(0).unwrap()
+        } else {
+            3600u64
+        };
+
+        let dunning_state = DunningState {
+            subscription_id,
+            attempts: 1,
+            next_retry_at: now + first_interval,
+            grace_period_ends_at: now + config.grace_period,
+            suspended: false,
+            last_failure_reason: reason,
+        };
+
+        env.storage().instance().set(&DataKey::DunningState(subscription_id), &dunning_state);
+
+        // Update subscription status
+        if
+            let Some(mut sub) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Subscription>(&DataKey::Subscription(subscription_id))
+        {
+            sub.status = SubscriptionStatus::InDunning;
+            env.storage().instance().set(&DataKey::Subscription(subscription_id), &sub);
+        }
+
+        (SubscriptionEnteredDunning {
+            subscription_id,
+            attempt: 1,
+            next_retry_at: dunning_state.next_retry_at,
+        }).publish(env);
+    }
+
     // ── RATE LIMITING / ANTI-FRAUD METHODS ──────────────────────────────────
 
     /// Admin sets the global rate limit configuration.
     pub fn set_rate_limit_config(
         env: Env,
         admin: Address,
-        config: RateLimitConfig,
+        config: RateLimitConfig
     ) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
@@ -1403,24 +1663,19 @@ impl PaymentContract {
         if admin != stored_admin {
             return Err(Error::Unauthorized);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RateLimitConfig, &config);
+        env.storage().instance().set(&DataKey::RateLimitConfig, &config);
         Ok(())
     }
 
     /// Returns the current rate limit configuration.
     /// Defaults to unlimited if not yet configured.
     pub fn get_rate_limit_config(env: Env) -> RateLimitConfig {
-        env.storage()
-            .instance()
-            .get(&DataKey::RateLimitConfig)
-            .unwrap_or(RateLimitConfig {
-                max_payments_per_window: 0,
-                window_duration: 0,
-                max_payment_amount: 0,
-                max_daily_volume: 0,
-            })
+        env.storage().instance().get(&DataKey::RateLimitConfig).unwrap_or(RateLimitConfig {
+            max_payments_per_window: 0,
+            window_duration: 0,
+            max_payment_amount: 0,
+            max_daily_volume: 0,
+        })
     }
 
     /// Returns the per-address rate limit state (or a zeroed default).
@@ -1443,7 +1698,7 @@ impl PaymentContract {
         env: Env,
         admin: Address,
         address: Address,
-        reason: String,
+        reason: String
     ) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
@@ -1467,19 +1722,13 @@ impl PaymentContract {
                 flagged: false,
             });
         rate_limit.flagged = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
-        AddressFlagged { address, reason }.publish(&env);
+        env.storage().instance().set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        (AddressFlagged { address, reason }).publish(&env);
         Ok(())
     }
 
     /// Admin removes the flag from an address, allowing it to create payments again.
-    pub fn unflag_address(
-        env: Env,
-        admin: Address,
-        address: Address,
-    ) -> Result<(), Error> {
+    pub fn unflag_address(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -1502,10 +1751,8 @@ impl PaymentContract {
                 flagged: false,
             });
         rate_limit.flagged = false;
-        env.storage()
-            .instance()
-            .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
-        AddressUnflagged { address }.publish(&env);
+        env.storage().instance().set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        (AddressUnflagged { address }).publish(&env);
         Ok(())
     }
 
@@ -1513,10 +1760,14 @@ impl PaymentContract {
     /// the configured rate limits and updates per-address counters.
     fn check_rate_limit(env: &Env, address: &Address, amount: i128) -> Result<(), Error> {
         // If no config is set, rate limiting is disabled.
-        let config: Option<RateLimitConfig> =
-            env.storage().instance().get(&DataKey::RateLimitConfig);
+        let config: Option<RateLimitConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateLimitConfig);
         let config = match config {
-            None => return Ok(()),
+            None => {
+                return Ok(());
+            }
             Some(c) => c,
         };
 
@@ -1546,16 +1797,18 @@ impl PaymentContract {
         let now = env.ledger().timestamp();
 
         // Reset daily volume counter when a calendar-day boundary is crossed.
-        if rate_limit.window_start > 0
-            && now / SECONDS_PER_DAY > rate_limit.window_start / SECONDS_PER_DAY
+        if
+            rate_limit.window_start > 0 &&
+            now / SECONDS_PER_DAY > rate_limit.window_start / SECONDS_PER_DAY
         {
             rate_limit.daily_volume = 0;
         }
 
         // Reset window payment counter when the window duration has elapsed.
-        if config.window_duration > 0
-            && rate_limit.window_start > 0
-            && now >= rate_limit.window_start + config.window_duration
+        if
+            config.window_duration > 0 &&
+            rate_limit.window_start > 0 &&
+            now >= rate_limit.window_start + config.window_duration
         {
             rate_limit.payment_count = 0;
             rate_limit.window_start = now;
@@ -1565,14 +1818,14 @@ impl PaymentContract {
         }
 
         // Enforce per-window payment count limit.
-        if config.max_payments_per_window > 0
-            && rate_limit.payment_count >= config.max_payments_per_window
+        if
+            config.max_payments_per_window > 0 &&
+            rate_limit.payment_count >= config.max_payments_per_window
         {
-            RateLimitBreached {
+            (RateLimitBreached {
                 address: address.clone(),
                 payment_count: rate_limit.payment_count,
-            }
-            .publish(env);
+            }).publish(env);
             return Err(Error::RateLimitExceeded);
         }
 
@@ -1589,9 +1842,7 @@ impl PaymentContract {
         rate_limit.payment_count += 1;
         rate_limit.last_payment_at = now;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage().instance().set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
 
         Ok(())
     }
