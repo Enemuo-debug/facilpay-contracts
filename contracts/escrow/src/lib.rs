@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String,
-    Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes, Env,
+    String, Vec,
 };
 
 #[derive(Clone)]
@@ -20,6 +20,9 @@ pub enum DataKey {
     ReputationScore(Address),
     ReputationConfig,
     VestingSchedule(u64),
+    MultiSigConfig,
+    AdminProposal(String),
+    ProposalCounter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,11 +49,19 @@ pub enum Error {
     CliffPeriodNotPassed = 10,
     MilestoneAlreadyReleased = 11,
     InsufficientVestedAmount = 12,
-    TransferFailed = 9,
-    InvalidParticipantCount = 9,
-    InvalidSharesSum = 10,
-    DuplicateApproval = 11,
-    ApprovalsThresholdNotMet = 12,
+    TransferFailed = 13,
+    InvalidParticipantCount = 14,
+    InvalidSharesSum = 15,
+    DuplicateApproval = 16,
+    ApprovalsThresholdNotMet = 17,
+    MultiSigNotInitialized = 18,
+    ProposalNotFound = 19,
+    ProposalExpired = 20,
+    ProposalAlreadyExecuted = 21,
+    MultiSigThresholdNotMet = 22,
+    InsufficientAdmins = 23,
+    NotAnAdmin = 24,
+    AlreadyApproved = 25,
 }
 
 #[contractevent]
@@ -262,11 +273,398 @@ pub struct VestingSchedule {
     pub milestones: Vec<VestingMilestone>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ActionType {
+    ReleaseEscrow,
+    ResolveDispute,
+    CompletePayment,
+    RefundPayment,
+    AddAdmin,
+    RemoveAdmin,
+    UpdateRequiredSignatures,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MultiSigConfig {
+    pub admins: Vec<Address>,
+    pub required_signatures: u32,
+    pub total_admins: u32,
+    pub proposal_ttl: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AdminProposal {
+    pub id: String,
+    pub proposer: Address,
+    pub action_type: ActionType,
+    pub target: Address,
+    pub data: Bytes,
+    pub approvals: Vec<Address>,
+    pub approval_count: u32,
+    pub executed: bool,
+    pub rejected: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionProposed {
+    pub proposal_id: String,
+    pub proposer: Address,
+    pub action_type: ActionType,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionApproved {
+    pub proposal_id: String,
+    pub approver: Address,
+    pub approval_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionExecuted {
+    pub proposal_id: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionRejected {
+    pub proposal_id: String,
+    pub rejected_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAdded {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRemoved {
+    pub admin: Address,
+}
+
 #[contract]
 pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::MultiSigConfig) {
+            panic!("already initialized");
+        }
+        let config = MultiSigConfig {
+            admins: Vec::from_array(&env, [admin.clone()]),
+            required_signatures: 1,
+            total_admins: 1,
+            proposal_ttl: 604800,
+        };
+        env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+        AdminAdded { admin }.publish(&env);
+    }
+
+    pub fn get_multisig_config(env: Env) -> MultiSigConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .expect("MultiSig not initialized")
+    }
+
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action_type: ActionType,
+        target: Address,
+        data: Bytes,
+    ) -> Result<String, Error> {
+        proposer.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&proposer) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage().instance().set(&DataKey::ProposalCounter, &counter);
+
+        let proposal_id = EscrowContract::u64_to_string(&env, counter);
+        let now = env.ledger().timestamp();
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = AdminProposal {
+            id: proposal_id.clone(),
+            proposer: proposer.clone(),
+            action_type: action_type.clone(),
+            target,
+            data,
+            approvals,
+            approval_count: 1,
+            executed: false,
+            rejected: false,
+            created_at: now,
+            expires_at: now + config.proposal_ttl,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        ActionProposed {
+            proposal_id: proposal_id.clone(),
+            proposer,
+            action_type,
+        }
+        .publish(&env);
+
+        Ok(proposal_id)
+    }
+
+    pub fn approve_action(
+        env: Env,
+        approver: Address,
+        proposal_id: String,
+    ) -> Result<(), Error> {
+        approver.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&approver) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut proposal: AdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed || proposal.rejected {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+
+        if proposal.approvals.contains(&approver) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(approver.clone());
+        proposal.approval_count += 1;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        ActionApproved {
+            proposal_id,
+            approver,
+            approval_count: proposal.approval_count,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn execute_action(
+        env: Env,
+        proposal_id: String,
+    ) -> Result<(), Error> {
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        let mut proposal: AdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed || proposal.rejected {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+
+        if proposal.approval_count < config.required_signatures {
+            return Err(Error::MultiSigThresholdNotMet);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        EscrowContract::dispatch_action(&env, &proposal)?;
+
+        ActionExecuted { proposal_id }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn reject_action(
+        env: Env,
+        rejecter: Address,
+        proposal_id: String,
+    ) -> Result<(), Error> {
+        rejecter.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&rejecter) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut proposal: AdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed || proposal.rejected {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        proposal.rejected = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        ActionRejected {
+            proposal_id,
+            rejected_by: rejecter,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn add_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&caller) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if !config.admins.contains(&new_admin) {
+            config.admins.push_back(new_admin.clone());
+            config.total_admins += 1;
+            env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+            AdminAdded { admin: new_admin }.publish(&env);
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_admin(
+        env: Env,
+        caller: Address,
+        admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&caller) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if config.total_admins <= config.required_signatures {
+            return Err(Error::InsufficientAdmins);
+        }
+
+        let mut new_admins = Vec::new(&env);
+        for a in config.admins.iter() {
+            if a != admin {
+                new_admins.push_back(a);
+            }
+        }
+
+        if new_admins.len() == config.admins.len() {
+            return Err(Error::NotAnAdmin);
+        }
+
+        config.admins = new_admins;
+        config.total_admins -= 1;
+        env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+        AdminRemoved { admin }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn update_required_signatures(
+        env: Env,
+        caller: Address,
+        required: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&caller) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if required == 0 || required > config.total_admins {
+            return Err(Error::InsufficientAdmins);
+        }
+
+        config.required_signatures = required;
+        env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+
+        Ok(())
+    }
+
     pub fn create_escrow(
         env: Env,
         customer: Address,
@@ -1306,11 +1704,11 @@ impl EscrowContract {
             }
             vested_amount
         } else {
-            // Time-linear vesting (proportional to time elapsed)
+            // Time-linear vesting (proportional to time elapsed since cliff)
             let total_duration = vesting_schedule
                 .end_timestamp
-                .saturating_sub(vesting_schedule.start_timestamp);
-            let elapsed = current_timestamp.saturating_sub(vesting_schedule.start_timestamp);
+                .saturating_sub(vesting_schedule.cliff_timestamp);
+            let elapsed = current_timestamp.saturating_sub(vesting_schedule.cliff_timestamp);
             
             if total_duration == 0 {
                 return 0;
@@ -1406,12 +1804,13 @@ impl EscrowContract {
                     && vesting_schedule.released_amount >= milestone.amount
                 {
                     milestone.released = true;
+                    let amount = milestone.amount;
                     milestones_vec.set(i, milestone);
 
                     MilestoneReleased {
                         escrow_id,
                         milestone_index: i as u32,
-                        amount: milestone.amount,
+                        amount,
                     }
                     .publish(&env);
                 }
@@ -1432,6 +1831,8 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(releasable_amount)
+    }
+
     // For existing tests that use synthetic token addresses, transfer calls are skipped when the
     // address is not a token contract. For real token contracts, transfer failures bubble up.
     fn transfer_if_token_contract(
@@ -1450,6 +1851,173 @@ impl EscrowContract {
             .is_err()
         {
             return Err(Error::TransferFailed);
+        }
+        Ok(())
+    }
+
+    fn u64_to_string(env: &Env, n: u64) -> String {
+        if n == 0 {
+            return String::from_str(env, "0");
+        }
+        let mut digits = [0u8; 20];
+        let mut count = 0usize;
+        let mut num = n;
+        while num > 0 {
+            digits[count] = b'0' + ((num % 10) as u8);
+            count += 1;
+            num /= 10;
+        }
+        // Reverse digits into a fixed buffer
+        let mut buf = [0u8; 20];
+        for i in 0..count {
+            buf[i] = digits[count - 1 - i];
+        }
+        String::from_bytes(env, &buf[..count])
+    }
+
+    fn read_u64_from_bytes(data: &Bytes, offset: u32) -> u64 {
+        let mut result: u64 = 0;
+        for i in 0..8u32 {
+            let byte = data.get(offset + i).unwrap_or(0) as u64;
+            result = (result << 8) | byte;
+        }
+        result
+    }
+
+    fn dispatch_action(env: &Env, proposal: &AdminProposal) -> Result<(), Error> {
+        match proposal.action_type {
+            ActionType::ReleaseEscrow => {
+                let escrow_id = EscrowContract::read_u64_from_bytes(&proposal.data, 0);
+                let early_release = proposal.data.get(8).unwrap_or(0) != 0;
+
+                if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+                    return Err(Error::EscrowNotFound);
+                }
+
+                let current_time: u64 = env.ledger().timestamp();
+                let mut escrow = EscrowContract::get_escrow(env, escrow_id);
+
+                match escrow.status {
+                    EscrowStatus::Locked => {
+                        if !early_release {
+                            if current_time < escrow.release_timestamp {
+                                return Err(Error::ReleaseNotYetAvailable);
+                            }
+                            if current_time < escrow.created_at + escrow.min_hold_period {
+                                return Err(Error::ReleaseOnHoldPeriod);
+                            }
+                        }
+                        escrow.status = EscrowStatus::Released;
+                    }
+                    EscrowStatus::Released => return Err(Error::AlreadyProcessed),
+                    EscrowStatus::Disputed => return Err(Error::InvalidStatus),
+                    EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+                }
+
+                env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+                EscrowContract::transfer_if_token_contract(env, &escrow.token, &escrow.merchant, escrow.amount)?;
+                EscrowContract::update_reputation_on_completion(env, &escrow.merchant);
+                EscrowContract::update_reputation_on_completion(env, &escrow.customer);
+
+                EscrowReleased {
+                    escrow_id,
+                    merchant: escrow.merchant,
+                    amount: escrow.amount,
+                }
+                .publish(env);
+            }
+            ActionType::ResolveDispute => {
+                let escrow_id = EscrowContract::read_u64_from_bytes(&proposal.data, 0);
+                let release_to_merchant = proposal.data.get(8).unwrap_or(0) != 0;
+
+                if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+                    return Err(Error::EscrowNotFound);
+                }
+
+                let mut escrow = EscrowContract::get_escrow(env, escrow_id);
+
+                match escrow.status {
+                    EscrowStatus::Disputed => {
+                        escrow.status = if release_to_merchant {
+                            EscrowStatus::Released
+                        } else {
+                            EscrowStatus::Resolved
+                        };
+                    }
+                    _ => return Err(Error::NotDisputed),
+                }
+
+                env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+                let (winner, loser) = if release_to_merchant {
+                    (escrow.merchant.clone(), escrow.customer.clone())
+                } else {
+                    (escrow.customer.clone(), escrow.merchant.clone())
+                };
+                EscrowContract::update_reputation_on_dispute_outcome(env, &winner, &loser);
+
+                if release_to_merchant {
+                    EscrowContract::transfer_if_token_contract(env, &escrow.token, &escrow.merchant, escrow.amount)?;
+                } else {
+                    EscrowContract::transfer_if_token_contract(env, &escrow.token, &escrow.customer, escrow.amount)?;
+                }
+
+                EscrowResolved {
+                    escrow_id,
+                    released_to_merchant: release_to_merchant,
+                    amount: escrow.amount,
+                }
+                .publish(env);
+            }
+            ActionType::AddAdmin => {
+                let new_admin = proposal.target.clone();
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if !config.admins.contains(&new_admin) {
+                    config.admins.push_back(new_admin.clone());
+                    config.total_admins += 1;
+                    env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+                    AdminAdded { admin: new_admin }.publish(env);
+                }
+            }
+            ActionType::RemoveAdmin => {
+                let admin_to_remove = proposal.target.clone();
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if config.total_admins <= config.required_signatures {
+                    return Err(Error::InsufficientAdmins);
+                }
+                let mut new_admins = Vec::new(env);
+                for a in config.admins.iter() {
+                    if a != admin_to_remove {
+                        new_admins.push_back(a);
+                    }
+                }
+                config.admins = new_admins;
+                config.total_admins -= 1;
+                env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+                AdminRemoved { admin: admin_to_remove }.publish(env);
+            }
+            ActionType::UpdateRequiredSignatures => {
+                let required = EscrowContract::read_u64_from_bytes(&proposal.data, 0) as u32;
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if required == 0 || required > config.total_admins {
+                    return Err(Error::InsufficientAdmins);
+                }
+                config.required_signatures = required;
+                env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+            }
+            _ => {}
         }
         Ok(())
     }

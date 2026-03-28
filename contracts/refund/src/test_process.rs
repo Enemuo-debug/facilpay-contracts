@@ -45,7 +45,7 @@ fn test_approve_refund() {
 
     env.mock_all_auths();
     let refund_id =
-        client.request_refund(&merchant, &payment_id, &customer, &amount, &1000, &token, &reason);
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &1000, &token, &reason, &0_u64);
 
     // Approve
     client.approve_refund(&admin, &refund_id);

@@ -7,6 +7,7 @@ use soroban_sdk::{
     contracttype,
     token,
     Address,
+    Bytes,
     Env,
     String,
     Vec,
@@ -36,6 +37,9 @@ pub enum DataKey {
     DunningConfig,
     DunningState(u64),
     EscrowedPayment(u64),
+    MultiSigConfig,
+    AdminProposal(String),
+    ProposalCounter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +114,8 @@ pub enum Error {
     PaymentNotDue = 15,
     MaxRetriesExceeded = 16,
     SubscriptionEnded = 17,
+    InvalidBatchSize = 18,
+    BatchPartialFailure = 19,
     RateLimitExceeded = 20,
     DailyVolumeExceeded = 21,
     AddressFlagged = 22,
@@ -118,8 +124,16 @@ pub enum Error {
     SubscriptionNotInDunning = 25,
     RetryNotDue = 26,
     GracePeriodExpired = 27,
-    EscrowMappingNotFound = 24,
-    EscrowBridgeFailed = 25,
+    EscrowMappingNotFound = 28,
+    EscrowBridgeFailed = 29,
+    MultiSigNotInitialized = 30,
+    ProposalNotFound = 31,
+    ProposalExpired = 32,
+    ProposalAlreadyExecuted = 33,
+    MultiSigThresholdNotMet = 34,
+    InsufficientAdmins = 35,
+    NotAnAdmin = 36,
+    AlreadyApproved = 37,
 }
 
 #[contractevent]
@@ -345,6 +359,104 @@ pub struct EscrowedPayment {
     pub auto_release_on_complete: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ActionType {
+    ReleaseEscrow,
+    ResolveDispute,
+    CompletePayment,
+    RefundPayment,
+    AddAdmin,
+    RemoveAdmin,
+    UpdateRequiredSignatures,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MultiSigConfig {
+    pub admins: Vec<Address>,
+    pub required_signatures: u32,
+    pub total_admins: u32,
+    pub proposal_ttl: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AdminProposal {
+    pub id: String,
+    pub proposer: Address,
+    pub action_type: ActionType,
+    pub target: Address,
+    pub data: Bytes,
+    pub approvals: Vec<Address>,
+    pub approval_count: u32,
+    pub executed: bool,
+    pub rejected: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchPaymentEntry {
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub currency: Currency,
+    pub expiration_duration: u64,
+    pub metadata: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchResult {
+    pub payment_id: u64,
+    pub success: bool,
+    pub error_code: Option<u32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionProposed {
+    pub proposal_id: String,
+    pub proposer: Address,
+    pub action_type: ActionType,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionApproved {
+    pub proposal_id: String,
+    pub approver: Address,
+    pub approval_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionExecuted {
+    pub proposal_id: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionRejected {
+    pub proposal_id: String,
+    pub rejected_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAdded {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRemoved {
+    pub admin: Address,
+}
+
 #[contract]
 pub struct PaymentContract;
 
@@ -357,10 +469,314 @@ const SECONDS_PER_DAY: u64 = 86400;
 #[contractimpl]
 impl PaymentContract {
     pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::MultiSigConfig) {
             panic!("already initialized");
         }
+        let config = MultiSigConfig {
+            admins: Vec::from_array(&env, [admin.clone()]),
+            required_signatures: 1,
+            total_admins: 1,
+            proposal_ttl: 604800,
+        };
+        env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+        // Keep Admin key for backward compat
         env.storage().instance().set(&DataKey::Admin, &admin);
+        AdminAdded { admin }.publish(&env);
+    }
+
+    pub fn get_multisig_config(env: Env) -> MultiSigConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .expect("MultiSig not initialized")
+    }
+
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action_type: ActionType,
+        target: Address,
+        data: Bytes,
+    ) -> Result<String, Error> {
+        proposer.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&proposer) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage().instance().set(&DataKey::ProposalCounter, &counter);
+
+        let proposal_id = PaymentContract::u64_to_string(&env, counter);
+        let now = env.ledger().timestamp();
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = AdminProposal {
+            id: proposal_id.clone(),
+            proposer: proposer.clone(),
+            action_type: action_type.clone(),
+            target,
+            data,
+            approvals,
+            approval_count: 1,
+            executed: false,
+            rejected: false,
+            created_at: now,
+            expires_at: now + config.proposal_ttl,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        ActionProposed {
+            proposal_id: proposal_id.clone(),
+            proposer,
+            action_type,
+        }
+        .publish(&env);
+
+        Ok(proposal_id)
+    }
+
+    pub fn approve_action(
+        env: Env,
+        approver: Address,
+        proposal_id: String,
+    ) -> Result<(), Error> {
+        approver.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&approver) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut proposal: AdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed || proposal.rejected {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+
+        if proposal.approvals.contains(&approver) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(approver.clone());
+        proposal.approval_count += 1;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        ActionApproved {
+            proposal_id,
+            approver,
+            approval_count: proposal.approval_count,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn execute_action(
+        env: Env,
+        proposal_id: String,
+    ) -> Result<(), Error> {
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        let mut proposal: AdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed || proposal.rejected {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::ProposalExpired);
+        }
+
+        if proposal.approval_count < config.required_signatures {
+            return Err(Error::MultiSigThresholdNotMet);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        PaymentContract::dispatch_action(&env, &proposal)?;
+
+        ActionExecuted { proposal_id }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn reject_action(
+        env: Env,
+        rejecter: Address,
+        proposal_id: String,
+    ) -> Result<(), Error> {
+        rejecter.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&rejecter) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut proposal: AdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed || proposal.rejected {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        proposal.rejected = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+
+        ActionRejected {
+            proposal_id,
+            rejected_by: rejecter,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn add_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&caller) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if !config.admins.contains(&new_admin) {
+            config.admins.push_back(new_admin.clone());
+            config.total_admins += 1;
+            env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+            AdminAdded { admin: new_admin }.publish(&env);
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_admin(
+        env: Env,
+        caller: Address,
+        admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&caller) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if config.total_admins <= config.required_signatures {
+            return Err(Error::InsufficientAdmins);
+        }
+
+        let mut new_admins = Vec::new(&env);
+        for a in config.admins.iter() {
+            if a != admin {
+                new_admins.push_back(a);
+            }
+        }
+
+        if new_admins.len() == config.admins.len() {
+            return Err(Error::NotAnAdmin);
+        }
+
+        config.admins = new_admins;
+        config.total_admins -= 1;
+        env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+        AdminRemoved { admin }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn update_required_signatures(
+        env: Env,
+        caller: Address,
+        required: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&caller) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if required == 0 || required > config.total_admins {
+            return Err(Error::InsufficientAdmins);
+        }
+
+        config.required_signatures = required;
+        env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+
+        Ok(())
     }
 
     pub fn create_payment(
@@ -374,7 +790,19 @@ impl PaymentContract {
         metadata: String
     ) -> Result<u64, Error> {
         customer.require_auth();
+        PaymentContract::do_create_payment(&env, customer, merchant, amount, token, currency, expiration_duration, metadata)
+    }
 
+    fn do_create_payment(
+        env: &Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String
+    ) -> Result<u64, Error> {
         // Validate currency
         if !PaymentContract::is_valid_currency(&currency) {
             return Err(Error::InvalidCurrency);
@@ -386,7 +814,7 @@ impl PaymentContract {
         }
 
         // Check rate limits and anti-fraud before processing
-        PaymentContract::check_rate_limit(&env, &customer, amount)?;
+        PaymentContract::check_rate_limit(env, &customer, amount)?;
 
         let counter: u64 = env.storage().instance().get(&DataKey::PaymentCounter).unwrap_or(0);
         let payment_id = counter + 1;
@@ -519,12 +947,12 @@ impl PaymentContract {
 
     pub fn complete_escrowed_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
@@ -683,25 +1111,29 @@ impl PaymentContract {
     pub fn complete_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
-        // Verify caller is the legitimate admin
-        let stored_admin: Address = env
+        // Verify caller is in the multisig admin list
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
 
+        PaymentContract::do_complete_payment(&env, payment_id)
+    }
+
+    fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
         // Check if payment exists
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
             return Err(Error::PaymentNotFound);
         }
 
-        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        let mut payment = PaymentContract::get_payment(env, payment_id);
 
         // Before updating status, check if payment is expired
-        if PaymentContract::is_payment_expired(&env, payment_id) {
+        if PaymentContract::is_payment_expired(env, payment_id) {
             return Err(Error::PaymentExpired);
         }
 
@@ -721,7 +1153,7 @@ impl PaymentContract {
         }
 
         // token transfer from customer to merchant
-        let token_client = token::Client::new(&env, &payment.token);
+        let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
 
         token_client.transfer_from(
@@ -737,7 +1169,7 @@ impl PaymentContract {
             payment_id,
             merchant: payment.merchant,
             amount: payment.amount,
-        }).publish(&env);
+        }).publish(env);
 
         Ok(())
     }
@@ -745,25 +1177,29 @@ impl PaymentContract {
     pub fn refund_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
-        // Verify caller is the legitimate admin
-        let stored_admin: Address = env
+        // Verify caller is in the multisig admin list
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
 
+        PaymentContract::do_refund_payment(&env, payment_id)
+    }
+
+    fn do_refund_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
         // Check if payment exists
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
             return Err(Error::PaymentNotFound);
         }
 
-        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        let mut payment = PaymentContract::get_payment(env, payment_id);
 
         // Before updating status, check if payment is expired
-        if PaymentContract::is_payment_expired(&env, payment_id) {
+        if PaymentContract::is_payment_expired(env, payment_id) {
             return Err(Error::PaymentExpired);
         }
 
@@ -788,7 +1224,7 @@ impl PaymentContract {
             payment_id,
             customer: payment.customer,
             amount: payment.amount,
-        }).publish(&env);
+        }).publish(env);
 
         Ok(())
     }
@@ -801,12 +1237,12 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
-        let stored_admin: Address = env
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
 
@@ -851,13 +1287,16 @@ impl PaymentContract {
 
     pub fn cancel_payment(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         caller.require_auth();
+        PaymentContract::do_cancel_payment(&env, caller, payment_id)
+    }
 
+    fn do_cancel_payment(env: &Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         // Check if payment exists
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
             return Err(Error::PaymentNotFound);
         }
 
-        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        let mut payment = PaymentContract::get_payment(env, payment_id);
 
         // Check authorization: caller must be customer, merchant, or admin
         let is_authorized = payment.customer == caller || payment.merchant == caller;
@@ -885,7 +1324,7 @@ impl PaymentContract {
             payment_id,
             cancelled_by: caller,
             timestamp,
-        }).publish(&env);
+        }).publish(env);
 
         Ok(())
     }
@@ -987,12 +1426,12 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
-        let stored_admin: Address = env
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
 
@@ -1198,12 +1637,12 @@ impl PaymentContract {
             .get(&DataKey::Subscription(subscription_id))
             .unwrap();
 
-        let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let config: Option<MultiSigConfig> = env.storage().instance().get(&DataKey::MultiSigConfig);
 
         let is_authorized =
             sub.customer == caller ||
             sub.merchant == caller ||
-            stored_admin.map_or(false, |a| a == caller);
+            config.map_or(false, |c| c.admins.contains(&caller));
 
         if !is_authorized {
             return Err(Error::Unauthorized);
@@ -1390,12 +1829,12 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
-        let stored_admin: Address = env
+        let ms_config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !ms_config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
 
@@ -1562,12 +2001,12 @@ impl PaymentContract {
     pub fn resolve_dunning(env: Env, admin: Address, subscription_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
-        let stored_admin: Address = env
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
 
@@ -1655,12 +2094,12 @@ impl PaymentContract {
         config: RateLimitConfig
     ) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env
+        let ms_config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !ms_config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&DataKey::RateLimitConfig, &config);
@@ -1701,12 +2140,12 @@ impl PaymentContract {
         reason: String
     ) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
         let mut rate_limit: AddressRateLimit = env
@@ -1730,12 +2169,12 @@ impl PaymentContract {
     /// Admin removes the flag from an address, allowing it to create payments again.
     pub fn unflag_address(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env
+        let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        if admin != stored_admin {
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
         let mut rate_limit: AddressRateLimit = env
@@ -1871,6 +2310,241 @@ impl PaymentContract {
             Ok(Ok(escrow_id)) => Ok(escrow_id),
             _ => Err(Error::EscrowBridgeFailed),
         }
+    }
+
+    fn u64_to_string(env: &Env, n: u64) -> String {
+        if n == 0 {
+            return String::from_str(env, "0");
+        }
+        let mut digits = [0u8; 20];
+        let mut count = 0usize;
+        let mut num = n;
+        while num > 0 {
+            digits[count] = b'0' + ((num % 10) as u8);
+            count += 1;
+            num /= 10;
+        }
+        // Reverse digits into a fixed buffer
+        let mut buf = [0u8; 20];
+        for i in 0..count {
+            buf[i] = digits[count - 1 - i];
+        }
+        String::from_bytes(env, &buf[..count])
+    }
+
+    fn read_u64_from_bytes(data: &Bytes, offset: u32) -> u64 {
+        let mut result: u64 = 0;
+        for i in 0..8u32 {
+            let byte = data.get(offset + i).unwrap_or(0) as u64;
+            result = (result << 8) | byte;
+        }
+        result
+    }
+
+    fn dispatch_action(env: &Env, proposal: &AdminProposal) -> Result<(), Error> {
+        match proposal.action_type {
+            ActionType::CompletePayment => {
+                let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
+                PaymentContract::do_complete_payment(env, payment_id)?;
+            }
+            ActionType::RefundPayment => {
+                let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
+                PaymentContract::do_refund_payment(env, payment_id)?;
+            }
+            ActionType::AddAdmin => {
+                let new_admin = proposal.target.clone();
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if !config.admins.contains(&new_admin) {
+                    config.admins.push_back(new_admin.clone());
+                    config.total_admins += 1;
+                    env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+                    AdminAdded { admin: new_admin }.publish(env);
+                }
+            }
+            ActionType::RemoveAdmin => {
+                let admin_to_remove = proposal.target.clone();
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if config.total_admins <= config.required_signatures {
+                    return Err(Error::InsufficientAdmins);
+                }
+                let mut new_admins = Vec::new(env);
+                for a in config.admins.iter() {
+                    if a != admin_to_remove {
+                        new_admins.push_back(a);
+                    }
+                }
+                config.admins = new_admins;
+                config.total_admins -= 1;
+                env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+                AdminRemoved { admin: admin_to_remove }.publish(env);
+            }
+            ActionType::UpdateRequiredSignatures => {
+                let required = PaymentContract::read_u64_from_bytes(&proposal.data, 0) as u32;
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if required == 0 || required > config.total_admins {
+                    return Err(Error::InsufficientAdmins);
+                }
+                config.required_signatures = required;
+                env.storage().instance().set(&DataKey::MultiSigConfig, &config);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ── BATCH PAYMENT OPERATIONS ──────────────────────────────────────────────
+
+    fn validate_batch_size(len: u32) -> Result<(), Error> {
+        const MAX_BATCH_SIZE: u32 = 50;
+        if len == 0 || len > MAX_BATCH_SIZE {
+            return Err(Error::InvalidBatchSize);
+        }
+        Ok(())
+    }
+
+    pub fn create_batch_payment(
+        env: Env,
+        entries: Vec<BatchPaymentEntry>,
+    ) -> Result<Vec<BatchResult>, Error> {
+        PaymentContract::validate_batch_size(entries.len())?;
+
+        // Require auth for all unique customers in the batch
+        let mut seen_customers: Vec<Address> = Vec::new(&env);
+        for entry in entries.iter() {
+            if !seen_customers.contains(&entry.customer) {
+                entry.customer.require_auth();
+                seen_customers.push_back(entry.customer.clone());
+            }
+        }
+
+        let mut results = Vec::new(&env);
+
+        for entry in entries.iter() {
+            let result = PaymentContract::do_create_payment(
+                &env,
+                entry.customer.clone(),
+                entry.merchant.clone(),
+                entry.amount,
+                entry.token.clone(),
+                entry.currency.clone(),
+                entry.expiration_duration,
+                entry.metadata.clone(),
+            );
+
+            match result {
+                Ok(payment_id) => {
+                    results.push_back(BatchResult {
+                        payment_id,
+                        success: true,
+                        error_code: None,
+                    });
+                }
+                Err(e) => {
+                    results.push_back(BatchResult {
+                        payment_id: 0,
+                        success: false,
+                        error_code: Some(e as u32),
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn complete_batch_payment(
+        env: Env,
+        admin: Address,
+        payment_ids: Vec<u64>,
+    ) -> Result<Vec<BatchResult>, Error> {
+        admin.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        PaymentContract::validate_batch_size(payment_ids.len())?;
+
+        let mut results = Vec::new(&env);
+
+        for payment_id in payment_ids.iter() {
+            let result = PaymentContract::do_complete_payment(&env, payment_id);
+
+            match result {
+                Ok(()) => {
+                    results.push_back(BatchResult {
+                        payment_id,
+                        success: true,
+                        error_code: None,
+                    });
+                }
+                Err(e) => {
+                    results.push_back(BatchResult {
+                        payment_id,
+                        success: false,
+                        error_code: Some(e as u32),
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn cancel_batch_payment(
+        env: Env,
+        caller: Address,
+        payment_ids: Vec<u64>,
+    ) -> Result<Vec<BatchResult>, Error> {
+        caller.require_auth();
+
+        PaymentContract::validate_batch_size(payment_ids.len())?;
+
+        let mut results = Vec::new(&env);
+
+        for payment_id in payment_ids.iter() {
+            let result = PaymentContract::do_cancel_payment(
+                &env,
+                caller.clone(),
+                payment_id,
+            );
+
+            match result {
+                Ok(()) => {
+                    results.push_back(BatchResult {
+                        payment_id,
+                        success: true,
+                        error_code: None,
+                    });
+                }
+                Err(e) => {
+                    results.push_back(BatchResult {
+                        payment_id,
+                        success: false,
+                        error_code: Some(e as u32),
+                    });
+                }
+            }
+        }
+
+        Ok(results)
     }
 }
 

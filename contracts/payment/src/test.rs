@@ -3,6 +3,7 @@
 use super::*;
 use soroban_sdk::testutils::{ Events, Ledger };
 use soroban_sdk::{ testutils::Address as _, token, Address, Env };
+use escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
 
 // ── RATE LIMITING / ANTI-FRAUD TESTS ────────────────────────────────────────
 
@@ -3118,6 +3119,8 @@ fn test_set_and_get_dunning_config() {
     assert_eq!(config.retry_intervals.len(), 3);
     assert_eq!(config.max_dunning_attempts, 4);
     assert_eq!(config.suspend_after_attempts, 3);
+}
+
 #[test]
 fn test_create_escrowed_payment_locks_funds_in_escrow() {
     let env = Env::default();
@@ -3265,4 +3268,408 @@ fn test_cancel_escrowed_payment_refunds_customer() {
     assert_eq!(escrow.status, EscrowStatus::Resolved);
     assert_eq!(token_user_client.balance(&escrow_contract_id), 0);
     assert_eq!(token_user_client.balance(&customer), amount);
+}
+
+// ── MULTI-SIG ADMIN TESTS (PAYMENT CONTRACT) ─────────────────────────────────
+
+#[test]
+fn test_payment_multisig_initialize() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let config = client.get_multisig_config();
+    assert_eq!(config.total_admins, 1);
+    assert_eq!(config.required_signatures, 1);
+    assert!(config.admins.contains(&admin));
+}
+
+#[test]
+fn test_payment_multisig_propose_complete_payment() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(1000);
+    let payment_id = client.create_payment(
+        &customer, &merchant, &500_i128, &token,
+        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+    );
+
+    let mut data_bytes = [0u8; 8];
+    let id_bytes = payment_id.to_be_bytes();
+    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
+
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::CompletePayment,
+        &merchant,
+        &data,
+    );
+    assert_eq!(proposal_id, String::from_str(&env, "1"));
+}
+
+#[test]
+fn test_payment_multisig_add_admin() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &new_admin);
+
+    let config = client.get_multisig_config();
+    assert_eq!(config.total_admins, 2);
+    assert!(config.admins.contains(&new_admin));
+}
+
+#[test]
+fn test_payment_multisig_reject_action() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2_u32);
+
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 8]);
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::CompletePayment,
+        &admin2,
+        &data,
+    );
+
+    client.reject_action(&admin2, &proposal_id);
+
+    // After rejection, execute should fail
+    let result = client.try_execute_action(&proposal_id);
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic]
+fn test_payment_multisig_not_admin_propose() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 8]);
+    // Non-admin trying to propose should panic
+    client.propose_action(
+        &non_admin,
+        &ActionType::CompletePayment,
+        &non_admin,
+        &data,
+    );
+}
+
+// ── BATCH PAYMENT TESTS ──────────────────────────────────────────────────────
+
+#[test]
+fn test_create_batch_payment_success() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 200_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        },
+    ];
+
+    let results = client.create_batch_payment(&entries);
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+    assert_eq!(results.get(0).unwrap().payment_id, 1);
+    assert_eq!(results.get(1).unwrap().payment_id, 2);
+}
+
+#[test]
+#[should_panic]
+fn test_create_batch_payment_empty() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries: soroban_sdk::Vec<BatchPaymentEntry> = soroban_sdk::vec![&env];
+    client.create_batch_payment(&entries);
+}
+
+#[test]
+#[should_panic]
+fn test_create_batch_payment_too_large() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    // Create 51 entries (over MAX_BATCH_SIZE of 50)
+    let mut entries = soroban_sdk::Vec::new(&env);
+    for _ in 0..51 {
+        entries.push_back(BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, ""),
+        });
+    }
+    client.create_batch_payment(&entries);
+}
+
+#[test]
+fn test_create_batch_payment_partial_failure() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    // Set a rate limit that allows only 1 payment per window
+    client.set_rate_limit_config(
+        &admin,
+        &RateLimitConfig {
+            max_payments_per_window: 1,
+            window_duration: 100_000,
+            max_payment_amount: 0,
+            max_daily_volume: 0,
+        }
+    );
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "ok"),
+        },
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "fail"),
+        },
+    ];
+
+    let results = client.create_batch_payment(&entries);
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(!results.get(1).unwrap().success);
+}
+
+#[test]
+fn test_complete_batch_payment_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_mint_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let total_amount = 300_i128;
+
+    client.initialize(&admin);
+    token_mint_client.mint(&customer, &total_amount);
+    token_user_client.approve(&customer, &contract_id, &total_amount, &10_000);
+
+    env.ledger().set_timestamp(1000);
+
+    let pid1 = client.create_payment(
+        &customer, &merchant, &100_i128, &token_contract_id,
+        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+    );
+    let pid2 = client.create_payment(
+        &customer, &merchant, &200_i128, &token_contract_id,
+        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+    );
+
+    let payment_ids = soroban_sdk::vec![&env, pid1, pid2];
+    let results = client.complete_batch_payment(&admin, &payment_ids);
+
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+}
+
+#[test]
+fn test_complete_batch_payment_partial_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_mint_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.initialize(&admin);
+    token_mint_client.mint(&customer, &100_i128);
+    token_user_client.approve(&customer, &contract_id, &100_i128, &10_000);
+
+    let pid1 = client.create_payment(
+        &customer, &merchant, &100_i128, &token_contract_id,
+        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+    );
+    // Complete pid1 first so it's already processed
+    client.complete_payment(&admin, &pid1);
+
+    // Now try batch complete: pid1 (already done) + 9999 (not found) = both fail
+    let payment_ids = soroban_sdk::vec![&env, pid1, 9999_u64];
+    let results = client.complete_batch_payment(&admin, &payment_ids);
+
+    assert_eq!(results.len(), 2);
+    assert!(!results.get(0).unwrap().success); // already completed
+    assert!(!results.get(1).unwrap().success); // not found
+}
+
+#[test]
+fn test_cancel_batch_payment_success() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let pid1 = client.create_payment(
+        &customer, &merchant, &100_i128, &token,
+        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+    );
+    let pid2 = client.create_payment(
+        &customer, &merchant, &200_i128, &token,
+        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+    );
+
+    let payment_ids = soroban_sdk::vec![&env, pid1, pid2];
+    let results = client.cancel_batch_payment(&customer, &payment_ids);
+
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+
+    let p1 = client.get_payment(&pid1);
+    assert_eq!(p1.status, PaymentStatus::Cancelled);
+    let p2 = client.get_payment(&pid2);
+    assert_eq!(p2.status, PaymentStatus::Cancelled);
+}
+
+#[test]
+fn test_batch_payment_events_emitted() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "batch_event_test"),
+        },
+    ];
+
+    let results = client.create_batch_payment(&entries);
+    assert!(results.get(0).unwrap().success);
+
+    // Verify events were emitted by checking payment was created
+    let payment = client.get_payment(&results.get(0).unwrap().payment_id);
+    assert_eq!(payment.customer, customer);
+    assert_eq!(payment.amount, 100_i128);
 }

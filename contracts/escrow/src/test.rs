@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
 
 // ── REPUTATION SYSTEM TESTS ──────────────────────────────────────────────────
 
@@ -1188,12 +1188,11 @@ fn test_create_vesting_escrow_with_milestones() {
             &1500_u64,
             &4000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     assert_eq!(escrow_id, 1);
 
-    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id);
     assert_eq!(vesting_schedule.total_amount, 10000);
     assert_eq!(vesting_schedule.released_amount, 0);
     assert_eq!(vesting_schedule.cliff_timestamp, 1500);
@@ -1225,10 +1224,9 @@ fn test_create_vesting_escrow_time_linear() {
             &2000_u64,
             &10000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
-    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id);
     assert_eq!(vesting_schedule.total_amount, 10000);
     assert_eq!(vesting_schedule.milestones.len(), 0);
 }
@@ -1273,8 +1271,9 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
             &1500_u64,
             &4000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
+}
+
 // ── MULTI-PARTY ESCROW TESTS ────────────────────────────────────────────────
 
 #[test]
@@ -1362,8 +1361,7 @@ fn test_create_vesting_escrow_cliff_before_current_time() {
             &500_u64,
             &4000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 }
 
 #[test]
@@ -1391,8 +1389,7 @@ fn test_create_vesting_escrow_end_before_cliff() {
             &5000_u64,
             &4000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 }
 
 #[test]
@@ -1418,8 +1415,7 @@ fn test_get_vested_amount_before_cliff() {
             &2000_u64,
             &10000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Before cliff - should be 0
     env.ledger().set_timestamp(1500);
@@ -1450,14 +1446,12 @@ fn test_get_vested_amount_after_cliff_linear() {
             &2000_u64,
             &10000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
-    // At cliff - nothing vested yet in linear model
+    // At cliff - nothing vested yet in linear model (elapsed = 0)
     env.ledger().set_timestamp(2000);
     let vested_amount = client.get_vested_amount(&escrow_id);
-    // Linear vesting starts after cliff
-    assert!(vested_amount > 0);
+    assert_eq!(vested_amount, 0);
 
     // Halfway through vesting period (at timestamp 6000)
     env.ledger().set_timestamp(6000);
@@ -1514,8 +1508,7 @@ fn test_get_vested_amount_milestone_based() {
             &1500_u64,
             &4000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Before first milestone
     env.ledger().set_timestamp(1800);
@@ -1577,8 +1570,7 @@ fn test_get_releasable_amount() {
             &1500_u64,
             &3000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // After first milestone - releasable = vested
     env.ledger().set_timestamp(2500);
@@ -1586,7 +1578,7 @@ fn test_get_releasable_amount() {
     assert_eq!(releasable, 3000);
 
     // Release first milestone
-    client.release_vested_amount(&admin, &escrow_id).unwrap();
+    client.release_vested_amount(&admin, &escrow_id);
 
     // After release - releasable should be 0 until next milestone
     let releasable = client.get_releasable_amount(&escrow_id);
@@ -1637,8 +1629,7 @@ fn test_release_vested_amount_milestone() {
             &1500_u64,
             &3000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Try to release before cliff - should fail
     env.ledger().set_timestamp(1400);
@@ -1647,20 +1638,20 @@ fn test_release_vested_amount_milestone() {
 
     // After first milestone
     env.ledger().set_timestamp(2500);
-    let released_amount = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released_amount = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released_amount, 3000);
 
     // Verify vesting schedule updated
-    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id);
     assert_eq!(vesting_schedule.released_amount, 3000);
 
     // After second milestone
     env.ledger().set_timestamp(3500);
-    let released_amount = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released_amount = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released_amount, 7000);
 
     // All released
-    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id);
     assert_eq!(vesting_schedule.released_amount, 10000);
 }
 
@@ -1689,12 +1680,15 @@ fn test_release_vested_amount_before_cliff() {
             &2000_u64,
             &10000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Try to release before cliff
     env.ledger().set_timestamp(1500);
-    client.release_vested_amount(&admin, &escrow_id).unwrap();
+    client.release_vested_amount(&admin, &escrow_id);
+}
+
+#[test]
+#[should_panic]
 fn test_create_multi_party_escrow_invalid_shares() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1853,12 +1847,11 @@ fn test_release_vested_amount_nothing_to_release() {
             &1500_u64,
             &2000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Before milestone unlocks
     env.ledger().set_timestamp(1800);
-    client.release_vested_amount(&admin, &escrow_id).unwrap();
+    client.release_vested_amount(&admin, &escrow_id);
 }
 
 #[test]
@@ -1912,28 +1905,27 @@ fn test_full_vesting_completion() {
             &1500_u64,
             &5000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Release each milestone as it unlocks
     env.ledger().set_timestamp(2500);
-    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released, 2500);
 
     env.ledger().set_timestamp(3500);
-    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released, 2500);
 
     env.ledger().set_timestamp(4500);
-    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released, 2500);
 
     env.ledger().set_timestamp(5500);
-    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released, 2500);
 
     // Verify all released
-    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id);
     assert_eq!(vesting_schedule.released_amount, 10000);
     assert_eq!(vesting_schedule.total_amount, 10000);
 }
@@ -1977,12 +1969,11 @@ fn test_partial_milestone_release() {
             &1500_u64,
             &3000_u64,
             &milestones,
-        )
-        .unwrap();
+        );
 
     // Only first milestone unlocked
     env.ledger().set_timestamp(2500);
-    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released, 5000);
 
     // Try to release again before second milestone - should fail
@@ -1991,8 +1982,12 @@ fn test_partial_milestone_release() {
 
     // Second milestone unlocks
     env.ledger().set_timestamp(3500);
-    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    let released = client.release_vested_amount(&admin, &escrow_id);
     assert_eq!(released, 5000);
+}
+
+#[test]
+#[should_panic]
 fn test_release_multi_party_escrow_threshold_not_met() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2030,4 +2025,274 @@ fn test_release_multi_party_escrow_threshold_not_met() {
 
     env.ledger().set_timestamp(1001);
     client.release_multi_party_escrow(&escrow_id);
+}
+
+// ── MULTI-SIG ADMIN TESTS ────────────────────────────────────────────────────
+
+#[test]
+fn test_multisig_initialize() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let config = client.get_multisig_config();
+    assert_eq!(config.total_admins, 1);
+    assert_eq!(config.required_signatures, 1);
+    assert!(config.admins.contains(&admin));
+}
+
+#[test]
+fn test_multisig_propose_release_escrow() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(2000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+
+    // Encode escrow_id as 8 big-endian bytes + 1 byte for early_release=true
+    let mut data_bytes = [0u8; 9];
+    let id_bytes = escrow_id.to_be_bytes();
+    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    data_bytes[8] = 1u8; // early_release = true
+    let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
+
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ReleaseEscrow,
+        &merchant,
+        &data,
+    );
+
+    // proposal id should be "1"
+    assert_eq!(proposal_id, String::from_str(&env, "1"));
+}
+
+#[test]
+fn test_multisig_approve_and_execute() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(2000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+
+    // Encode escrow_id + early_release=true
+    let mut data_bytes = [0u8; 9];
+    let id_bytes = escrow_id.to_be_bytes();
+    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    data_bytes[8] = 1u8;
+    let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
+
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ReleaseEscrow,
+        &merchant,
+        &data,
+    );
+
+    // With required_signatures=1 and 1 approval already from proposer, execute directly
+    client.execute_action(&proposal_id);
+
+    // Verify escrow was released by querying via client
+    let escrow = env.as_contract(&contract_id, || {
+        EscrowContract::get_escrow(&env, escrow_id)
+    });
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
+
+#[test]
+#[should_panic]
+fn test_multisig_duplicate_approval_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2_u32);
+
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ReleaseEscrow,
+        &admin2,
+        &data,
+    );
+
+    // admin already approved when proposing, approving again should panic
+    client.approve_action(&admin, &proposal_id);
+}
+
+#[test]
+fn test_multisig_proposal_expires() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2_u32);
+
+    env.ledger().set_timestamp(1000);
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ReleaseEscrow,
+        &admin2,
+        &data,
+    );
+
+    // Advance past TTL (604800 seconds = 7 days)
+    env.ledger().set_timestamp(1000 + 604801);
+
+    // Approving an expired proposal should fail
+    let result = client.try_approve_action(&admin2, &proposal_id);
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic]
+fn test_multisig_threshold_not_met() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2_u32);
+
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ReleaseEscrow,
+        &admin2,
+        &data,
+    );
+
+    // Only 1 approval (from proposer), threshold is 2 — should panic
+    client.execute_action(&proposal_id);
+}
+
+#[test]
+fn test_multisig_add_admin() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &new_admin);
+
+    let config = client.get_multisig_config();
+    assert_eq!(config.total_admins, 2);
+    assert!(config.admins.contains(&new_admin));
+}
+
+#[test]
+#[should_panic]
+fn test_multisig_remove_admin_drops_below_threshold() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    // With 1 admin and required_signatures=1, removing admin drops below threshold
+    client.remove_admin(&admin, &admin);
+}
+
+#[test]
+fn test_multisig_reject_action() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2_u32);
+
+    let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ReleaseEscrow,
+        &admin2,
+        &data,
+    );
+
+    client.reject_action(&admin2, &proposal_id);
+
+    // After rejection, execute should fail
+    let result = client.try_execute_action(&proposal_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_multisig_resolve_dispute_via_proposal() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(2000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    // Encode escrow_id + release_to_merchant=false (0)
+    let mut data_bytes = [0u8; 9];
+    let id_bytes = escrow_id.to_be_bytes();
+    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    data_bytes[8] = 0u8; // release to customer
+    let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
+
+    let proposal_id = client.propose_action(
+        &admin,
+        &ActionType::ResolveDispute,
+        &customer,
+        &data,
+    );
+
+    client.execute_action(&proposal_id);
+
+    let escrow = env.as_contract(&contract_id, || {
+        EscrowContract::get_escrow(&env, escrow_id)
+    });
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
 }

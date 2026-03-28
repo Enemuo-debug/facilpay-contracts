@@ -25,6 +25,8 @@ pub enum DataKey {
     ArbitratorsVoted(u64),        // case_id -> Vec<Address>
     ArbitratorVote(u64, Address), // case_id, arbitrator
     PoolToken(u64),
+    DefaultRefundPolicy,
+    RefundPolicy(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +55,8 @@ pub enum Error {
     RefundExceedsPolicy = 12,
     PolicyNotFound = 13,
     PolicyInactive = 14,
+    QuorumNotReached = 15,
+    NotArbitrator = 16,
 }
 
 #[contractevent]
@@ -167,6 +171,45 @@ pub struct ArbitratorVote {
     pub voted_for_refund: bool,
     pub reasoning_hash: BytesN<32>,
     pub voted_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundPolicy {
+    pub merchant: Address,
+    pub refund_window: u64,
+    pub max_refund_percentage: u32,
+    pub requires_admin_approval: bool,
+    pub auto_approve_below: i128,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoApproved {
+    pub refund_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicySet {
+    pub merchant: Address,
+    pub refund_window: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyDeactivated {
+    pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyOverrideApplied {
+    pub refund_id: u64,
+    pub admin: Address,
+    pub reason: String,
 }
 
 #[contract]

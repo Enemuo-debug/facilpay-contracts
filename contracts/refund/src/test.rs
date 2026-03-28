@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{ testutils::Address as _, testutils::Events, Address, Env, String };
+use soroban_sdk::{ testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env, String };
 
 #[test]
 fn test_request_refund_with_valid_data() {
@@ -56,7 +56,8 @@ fn test_refund_id_increments_correctly() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let refund_id2 = client.request_refund(
@@ -66,7 +67,8 @@ fn test_refund_id_increments_correctly() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     assert_eq!(refund_id1, 1u64);
@@ -140,7 +142,8 @@ fn test_request_multiple_refunds_and_retrieve_each() {
         &amount1,
         &amount1,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let refund_id2 = client.request_refund(
@@ -150,7 +153,8 @@ fn test_request_multiple_refunds_and_retrieve_each() {
         &amount2,
         &amount2,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let refund_id3 = client.request_refund(
@@ -160,7 +164,8 @@ fn test_request_multiple_refunds_and_retrieve_each() {
         &amount3,
         &amount3,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let refund1 = client.get_refund(&refund_id1);
@@ -195,7 +200,7 @@ fn test_request_refund_with_zero_amount_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason);
+    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason, &0_u64);
 }
 
 #[test]
@@ -213,7 +218,7 @@ fn test_request_refund_with_negative_amount_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason);
+    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason, &0_u64);
 }
 
 #[test]
@@ -231,7 +236,7 @@ fn test_request_refund_with_invalid_payment_id_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason);
+    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason, &0_u64);
 }
 
 #[test]
@@ -267,6 +272,7 @@ fn test_refund_requested_event_is_emitted() {
         &amount,
         &token,
         &reason,
+        &0_u64
     );
 
     // Check that the event was emitted
@@ -686,7 +692,7 @@ fn test_approve_correct_refund_among_multiple() {
         &amount,
         &token,
         &reason,
-        &reason
+        &0_u64
     );
     let refund_id2 = client.request_refund(
         &merchant,
@@ -696,7 +702,7 @@ fn test_approve_correct_refund_among_multiple() {
         &amount,
         &token,
         &reason,
-        &reason
+        &0_u64
     );
     let refund_id3 = client.request_refund(
         &merchant,
@@ -705,7 +711,8 @@ fn test_approve_correct_refund_among_multiple() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     client.approve_refund(&admin, &refund_id2);
@@ -809,7 +816,8 @@ fn test_request_partial_refund_half_payment() {
         &amount,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let refund = client.get_refund(&refund_id);
@@ -840,7 +848,8 @@ fn test_multiple_partial_refunds_for_same_payment() {
         &700i128,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     client.approve_refund(&admin, &refund_id1);
     client.process_refund(&admin, &refund_id1);
@@ -852,7 +861,8 @@ fn test_multiple_partial_refunds_for_same_payment() {
         &800i128,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     let refund2 = client.get_refund(&refund_id2);
     assert_eq!(refund2.status, RefundStatus::Requested);
@@ -884,7 +894,8 @@ fn test_request_refund_exceeding_original_payment_should_fail() {
         &amount,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 }
 
@@ -911,7 +922,8 @@ fn test_cumulative_refunds_exceeding_payment_should_fail() {
         &700i128,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     client.approve_refund(&admin, &refund_id1);
     client.process_refund(&admin, &refund_id1);
@@ -923,7 +935,8 @@ fn test_cumulative_refunds_exceeding_payment_should_fail() {
         &400i128,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 }
 
@@ -949,7 +962,8 @@ fn test_status_queries_and_counts() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     let r2 = client.request_refund(
         &merchant,
@@ -958,7 +972,8 @@ fn test_status_queries_and_counts() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     let r3 = client.request_refund(
         &merchant,
@@ -967,7 +982,8 @@ fn test_status_queries_and_counts() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     assert_eq!(client.get_refund_count_by_status(&RefundStatus::Requested), 3u64);
@@ -1022,7 +1038,8 @@ fn test_pagination_for_status_queries() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     let r2 = client.request_refund(
         &merchant,
@@ -1031,7 +1048,8 @@ fn test_pagination_for_status_queries() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     let r3 = client.request_refund(
         &merchant,
@@ -1040,7 +1058,8 @@ fn test_pagination_for_status_queries() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     let r4 = client.request_refund(
         &merchant,
@@ -1049,7 +1068,8 @@ fn test_pagination_for_status_queries() {
         &amount,
         &amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let page = client.get_refunds_by_status(&RefundStatus::Requested, &2u64, &1u64);
@@ -1087,7 +1107,8 @@ fn test_refund_for_zero_amount_payment_should_fail() {
         &amount,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 }
 
@@ -1113,7 +1134,8 @@ fn test_full_refund_is_allowed() {
         &amount,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
 
     let refund = client.get_refund(&refund_id);
@@ -1154,7 +1176,8 @@ fn test_can_refund_payment_helper() {
         &400i128,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     client.approve_refund(&admin, &refund_id);
     client.process_refund(&admin, &refund_id);
@@ -1186,7 +1209,8 @@ fn test_can_refund_payment_helper_rejects_overflow() {
         &900i128,
         &original_payment_amount,
         &token,
-        &reason
+        &reason,
+        &0_u64
     );
     client.approve_refund(&admin, &refund_id);
     client.process_refund(&admin, &refund_id);
@@ -1225,6 +1249,7 @@ fn test_arbitration_quorum() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
@@ -1275,6 +1300,7 @@ fn test_arbitration_deadline_enforcement() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
@@ -1328,6 +1354,7 @@ fn test_arbitration_success_fee_distribution() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
@@ -1394,6 +1421,7 @@ fn test_arbitration_arbitrator_cannot_vote() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
@@ -1453,6 +1481,7 @@ fn test_arbitration_outcome_execution_approved() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
@@ -1528,6 +1557,7 @@ fn test_arbitration_outcome_execution_rejected() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
