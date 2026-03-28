@@ -12,7 +12,7 @@ pub enum DataKey {
     MultiPartyEscrow(u64),
     MultiPartyEscrowCounter,
     CustomerEscrows(Address, u64),
-    MerchantEscrows(Address, u64),
+    Merch3antEscrows(Address, u64),
     CustomerEscrowCount(Address),
     MerchantEscrowCount(Address),
     EscrowEvidence(u64, u64),
@@ -23,6 +23,9 @@ pub enum DataKey {
     MultiSigConfig,
     AdminProposal(String),
     ProposalCounter,
+    TimeLockAction(u64),
+    TimeLockCounter,
+    TimeLockConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +65,10 @@ pub enum Error {
     InsufficientAdmins = 23,
     NotAnAdmin = 24,
     AlreadyApproved = 25,
+    ActionNotReady = 9,
+    ActionExpired = 10,
+    ActionAlreadyExecuted = 11,
+    ActionCancelled = 12,
 }
 
 #[contractevent]
@@ -310,6 +317,34 @@ pub struct AdminProposal {
     pub expires_at: u64,
 }
 
+#[contracttype]
+pub struct TimeLockAction {
+    pub action_id: u64,
+    pub action_type: EscrowActionType,
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub queued_at: u64,
+    pub executable_after: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+    pub data: Bytes,
+}
+
+#[contracttype]
+pub enum EscrowActionType {
+    ResolveDispute { release_to_merchant: bool },
+    ForceRelease,
+    UpdateReleaseTimestamp { new_timestamp: u64 },
+    CancelEscrow,
+}
+
+#[contracttype]
+pub struct TimeLockConfig {
+    pub delay: u64,           // minimum seconds before execution
+    pub grace_period: u64,    // window after delay before action expires
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionProposed {
@@ -349,6 +384,36 @@ pub struct AdminAdded {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminRemoved {
     pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeLockActionQueued {
+    pub action_id: u64,
+    pub escrow_id: u64,
+    pub executable_after: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeLockActionExecuted {
+    pub action_id: u64,
+    pub escrow_id: u64,
+    pub executed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeLockActionCancelled {
+    pub action_id: u64,
+    pub cancelled_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeLockConfigUpdated {
+    pub delay: u64,
+    pub grace_period: u64,
 }
 
 #[contract]
@@ -951,6 +1016,23 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
+        // Check if this is being called from execute_queued_action
+        let config = Self::get_multisig_config(env.clone());
+        if config.admins.contains(&admin) && early_release {
+            // Admin force release requires time-lock
+            return Err(Error::Unauthorized);
+        }
+
+        Self::internal_release_escrow(env, admin, escrow_id, early_release)
+    }
+
+    fn internal_release_escrow(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        early_release: bool,
+    ) -> Result<(), Error> {
+
         let current_time: u64 = env.ledger().timestamp();
 
         // Check if escrow exists
@@ -1226,6 +1308,23 @@ impl EscrowContract {
         release_to_merchant: bool,
     ) -> Result<(), Error> {
         admin.require_auth();
+
+        // Check if this is being called from execute_queued_action
+        let config = Self::get_multisig_config(env.clone());
+        if config.admins.contains(&admin) {
+            // Admin actions require time-lock for sensitive operations
+            return Err(Error::Unauthorized);
+        }
+
+        Self::internal_resolve_dispute(env, admin, escrow_id, release_to_merchant)
+    }
+
+    fn internal_resolve_dispute(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        release_to_merchant: bool,
+    ) -> Result<(), Error> {
 
         // Check if escrow exists
         if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
@@ -2021,6 +2120,166 @@ impl EscrowContract {
         }
         Ok(())
     }
+
+    pub fn queue_action(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        action_type: EscrowActionType,
+        data: Bytes,
+    ) -> Result<u64, Error> {
+        admin.require_auth();
+        
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let timelock_config = Self::get_timelock_config(env.clone());
+        let current_time = env.ledger().timestamp();
+        
+        let action_id = env.storage().instance().get(&DataKey::TimeLockCounter).unwrap_or(0u64) + 1;
+        env.storage().instance().set(&DataKey::TimeLockCounter, &action_id);
+
+        let action = TimeLockAction {
+            action_id,
+            action_type,
+            escrow_id,
+            proposed_by: admin,
+            queued_at: current_time,
+            executable_after: current_time + timelock_config.delay,
+            expires_at: current_time + timelock_config.delay + timelock_config.grace_period,
+            executed: false,
+            cancelled: false,
+            data,
+        };
+
+        env.storage().instance().set(&DataKey::TimeLockAction(action_id), &action);
+        
+        TimeLockActionQueued {
+            action_id,
+            escrow_id,
+            executable_after: action.executable_after,
+        }.publish(&env);
+
+        Ok(action_id)
+    }
+
+    pub fn execute_queued_action(env: Env, action_id: u64) -> Result<(), Error> {
+        let mut action: TimeLockAction = env.storage().instance()
+            .get(&DataKey::TimeLockAction(action_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if action.executed {
+            return Err(Error::ActionAlreadyExecuted);
+        }
+        if action.cancelled {
+            return Err(Error::ActionCancelled);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time < action.executable_after {
+            return Err(Error::ActionNotReady);
+        }
+        if current_time > action.expires_at {
+            return Err(Error::ActionExpired);
+        }
+
+        action.executed = true;
+        env.storage().instance().set(&DataKey::TimeLockAction(action_id), &action);
+
+        match action.action_type {
+            EscrowActionType::ResolveDispute { release_to_merchant } => {
+                Self::internal_resolve_dispute(env.clone(), action.proposed_by, action.escrow_id, release_to_merchant)?;
+            }
+            EscrowActionType::ForceRelease => {
+                Self::internal_release_escrow(env.clone(), action.proposed_by, action.escrow_id, true)?;
+            }
+            _ => {}
+        }
+
+        TimeLockActionExecuted {
+            action_id,
+            escrow_id: action.escrow_id,
+            executed_at: current_time,
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn cancel_queued_action(env: Env, admin: Address, action_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+        
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut action: TimeLockAction = env.storage().instance()
+            .get(&DataKey::TimeLockAction(action_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if action.executed {
+            return Err(Error::ActionAlreadyExecuted);
+        }
+        if action.cancelled {
+            return Err(Error::ActionCancelled);
+        }
+
+        if action.proposed_by != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        action.cancelled = true;
+        env.storage().instance().set(&DataKey::TimeLockAction(action_id), &action);
+
+        TimeLockActionCancelled {
+            action_id,
+            cancelled_by: admin,
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_queued_action(env: Env, action_id: u64) -> Result<TimeLockAction, Error> {
+        env.storage().instance()
+            .get(&DataKey::TimeLockAction(action_id))
+            .ok_or(Error::ProposalNotFound)
+    }
+
+    pub fn set_timelock_config(env: Env, admin: Address, config: TimeLockConfig) -> Result<(), Error> {
+        admin.require_auth();
+        
+        let multisig_config = Self::get_multisig_config(env.clone());
+        if !multisig_config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if config.delay < 3600 || config.delay > 604800 {
+            return Err(Error::InvalidStatus);
+        }
+
+        env.storage().instance().set(&DataKey::TimeLockConfig, &config);
+        
+        TimeLockConfigUpdated {
+            delay: config.delay,
+            grace_period: config.grace_period,
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    fn get_timelock_config(env: Env) -> TimeLockConfig {
+        env.storage().instance()
+            .get(&DataKey::TimeLockConfig)
+            .unwrap_or(TimeLockConfig {
+                delay: 86400,      // 24 hours default
+                grace_period: 86400, // 24 hours default
+            })
+    }
 }
 
 mod test;
+
+#[cfg(test)]
+mod timelock_test;
