@@ -350,6 +350,55 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "MultiSigConfig"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "admins"
+                              },
+                              "val": {
+                                "vec": [
+                                  {
+                                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "proposal_ttl"
+                              },
+                              "val": {
+                                "u64": "604800"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "required_signatures"
+                              },
+                              "val": {
+                                "u32": 1
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_admins"
+                              },
+                              "val": {
+                                "u32": 1
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Payment"
                             },
                             {
@@ -433,6 +482,14 @@
                               },
                               "val": {
                                 "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "refunded_amount"
+                              },
+                              "val": {
+                                "i128": "0"
                               }
                             },
                             {

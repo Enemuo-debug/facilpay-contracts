@@ -40,6 +40,9 @@ pub enum DataKey {
     MultiSigConfig,
     AdminProposal(String),
     ProposalCounter,
+    FeeConfig,
+    MerchantFeeRecord(Address),
+    AccumulatedFees,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,6 +137,8 @@ pub enum Error {
     InsufficientAdmins = 35,
     NotAnAdmin = 36,
     AlreadyApproved = 37,
+    FeeConfigNotFound = 38,
+    InsufficientFees = 39,
 }
 
 #[contractevent]
@@ -416,6 +421,35 @@ pub struct BatchResult {
     pub error_code: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum FeeTier {
+    Standard,
+    Silver,     // > 10,000 XLM volume
+    Gold,       // > 100,000 XLM volume
+    Platinum,   // > 1,000,000 XLM volume
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeConfig {
+    pub fee_bps: u32,
+    pub min_fee: i128,
+    pub max_fee: i128,
+    pub treasury: Address,
+    pub fee_token: Address,
+    pub active: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantFeeRecord {
+    pub merchant: Address,
+    pub total_fees_paid: i128,
+    pub total_volume: i128,
+    pub fee_tier: FeeTier,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionProposed {
@@ -457,6 +491,36 @@ pub struct AdminRemoved {
     pub admin: Address,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeCollected {
+    pub payment_id: u64,
+    pub fee_amount: i128,
+    pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeesWithdrawn {
+    pub amount: i128,
+    pub treasury: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantTierUpgraded {
+    pub merchant: Address,
+    pub old_tier: FeeTier,
+    pub new_tier: FeeTier,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfigUpdated {
+    pub fee_bps: u32,
+    pub treasury: Address,
+}
+
 #[contract]
 pub struct PaymentContract;
 
@@ -465,6 +529,11 @@ const MAX_METADATA_SIZE: u32 = 512;
 const MAX_NOTES_SIZE: u32 = 1024;
 const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
+
+// Fee tier volume thresholds (raw token units)
+const SILVER_VOLUME_THRESHOLD: i128 = 10_000;
+const GOLD_VOLUME_THRESHOLD: i128 = 100_000;
+const PLATINUM_VOLUME_THRESHOLD: i128 = 1_000_000;
 
 #[contractimpl]
 impl PaymentContract {
@@ -1152,7 +1221,17 @@ impl PaymentContract {
             }
         }
 
-        // token transfer from customer to merchant
+        // Deduct platform fee (if configured) and get net amount for merchant
+        let net_amount = PaymentContract::deduct_fee(
+            env,
+            payment_id,
+            payment.amount,
+            &payment.merchant,
+            &payment.token,
+            &payment.customer,
+        );
+
+        // Token transfer: net amount from customer to merchant
         let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
 
@@ -1160,7 +1239,7 @@ impl PaymentContract {
             &contract_address,
             &payment.customer,
             &payment.merchant,
-            &payment.amount
+            &net_amount
         );
 
         env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
@@ -2402,6 +2481,253 @@ impl PaymentContract {
             _ => {}
         }
         Ok(())
+    }
+
+    // ── FEE MANAGEMENT ───────────────────────────────────────────────────────
+
+    /// Admin sets the platform fee configuration.
+    pub fn set_fee_config(
+        env: Env,
+        admin: Address,
+        fee_config: FeeConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        FeeConfigUpdated {
+            fee_bps: fee_config.fee_bps,
+            treasury: fee_config.treasury.clone(),
+        }
+        .publish(&env);
+        env.storage().instance().set(&DataKey::FeeConfig, &fee_config);
+        Ok(())
+    }
+
+    /// Returns the current fee configuration.
+    pub fn get_fee_config(env: Env) -> Result<FeeConfig, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(Error::FeeConfigNotFound)
+    }
+
+    /// Calculates the fee for a given amount and merchant (accounting for tier discount).
+    pub fn calculate_fee(env: Env, amount: i128, merchant: Address) -> i128 {
+        let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        let config = match config {
+            None => return 0,
+            Some(c) if !c.active => return 0,
+            Some(c) => c,
+        };
+        let record: MerchantFeeRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
+            .unwrap_or(MerchantFeeRecord {
+                merchant,
+                total_fees_paid: 0,
+                total_volume: 0,
+                fee_tier: FeeTier::Standard,
+            });
+        PaymentContract::compute_fee_amount(
+            amount,
+            config.fee_bps,
+            &record.fee_tier,
+            config.min_fee,
+            config.max_fee,
+        )
+    }
+
+    /// Returns the fee record for a given merchant.
+    pub fn get_merchant_fee_record(env: Env, merchant: Address) -> MerchantFeeRecord {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
+            .unwrap_or(MerchantFeeRecord {
+                merchant,
+                total_fees_paid: 0,
+                total_volume: 0,
+                fee_tier: FeeTier::Standard,
+            })
+    }
+
+    /// Returns the total fees accumulated in the contract.
+    pub fn get_accumulated_fees(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::AccumulatedFees).unwrap_or(0)
+    }
+
+    /// Admin withdraws accumulated fees to the treasury address.
+    pub fn withdraw_fees(
+        env: Env,
+        admin: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(Error::FeeConfigNotFound)?;
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        if amount > accumulated {
+            return Err(Error::InsufficientFees);
+        }
+        let token_client = token::Client::new(&env, &fee_config.fee_token);
+        token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &(accumulated - amount));
+        FeesWithdrawn {
+            amount,
+            treasury: fee_config.treasury.clone(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Internal: deducts the platform fee from a payment, transfers fee to contract,
+    /// updates merchant record and accumulated fees, and returns the net amount.
+    fn deduct_fee(
+        env: &Env,
+        payment_id: u64,
+        amount: i128,
+        merchant: &Address,
+        token: &Address,
+        customer: &Address,
+    ) -> i128 {
+        let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        let config = match config {
+            None => return amount,
+            Some(c) if !c.active => return amount,
+            Some(c) if c.fee_token != *token => return amount,
+            Some(c) => c,
+        };
+
+        let mut record: MerchantFeeRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
+            .unwrap_or(MerchantFeeRecord {
+                merchant: merchant.clone(),
+                total_fees_paid: 0,
+                total_volume: 0,
+                fee_tier: FeeTier::Standard,
+            });
+
+        let fee = PaymentContract::compute_fee_amount(
+            amount,
+            config.fee_bps,
+            &record.fee_tier,
+            config.min_fee,
+            config.max_fee,
+        );
+
+        if fee <= 0 {
+            return amount;
+        }
+
+        let net_amount = amount - fee;
+
+        // Transfer fee from customer to contract
+        let token_client = token::Client::new(env, token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(&contract_address, customer, &contract_address, &fee);
+
+        // Update accumulated fees
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &(accumulated + fee));
+
+        // Update merchant record and check for tier upgrades
+        let old_tier = record.fee_tier.clone();
+        record.total_fees_paid += fee;
+        record.total_volume += amount;
+
+        let new_tier = PaymentContract::get_tier_for_volume(record.total_volume);
+        if new_tier != old_tier {
+            record.fee_tier = new_tier.clone();
+            MerchantTierUpgraded {
+                merchant: merchant.clone(),
+                old_tier,
+                new_tier,
+            }
+            .publish(env);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantFeeRecord(merchant.clone()), &record);
+
+        FeeCollected {
+            payment_id,
+            fee_amount: fee,
+            merchant: merchant.clone(),
+        }
+        .publish(env);
+
+        net_amount
+    }
+
+    /// Computes the fee amount applying tier discount and min/max clamping.
+    fn compute_fee_amount(
+        amount: i128,
+        fee_bps: u32,
+        tier: &FeeTier,
+        min_fee: i128,
+        max_fee: i128,
+    ) -> i128 {
+        let discount = PaymentContract::get_tier_discount_bps(tier);
+        let effective_bps = fee_bps - (fee_bps * discount / 10000);
+        let raw_fee = amount * effective_bps as i128 / 10000;
+
+        let fee = if min_fee > 0 && raw_fee < min_fee { min_fee } else { raw_fee };
+        let fee = if max_fee > 0 && fee > max_fee { max_fee } else { fee };
+
+        if fee < 0 { 0 } else { fee }
+    }
+
+    fn get_tier_discount_bps(tier: &FeeTier) -> u32 {
+        match tier {
+            FeeTier::Standard => 0,
+            FeeTier::Silver => 500,   // 5% discount on fee
+            FeeTier::Gold => 1500,    // 15% discount on fee
+            FeeTier::Platinum => 3000, // 30% discount on fee
+        }
+    }
+
+    fn get_tier_for_volume(volume: i128) -> FeeTier {
+        if volume > PLATINUM_VOLUME_THRESHOLD {
+            FeeTier::Platinum
+        } else if volume > GOLD_VOLUME_THRESHOLD {
+            FeeTier::Gold
+        } else if volume > SILVER_VOLUME_THRESHOLD {
+            FeeTier::Silver
+        } else {
+            FeeTier::Standard
+        }
     }
 
     // ── BATCH PAYMENT OPERATIONS ──────────────────────────────────────────────
