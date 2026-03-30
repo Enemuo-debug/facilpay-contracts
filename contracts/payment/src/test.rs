@@ -3194,7 +3194,9 @@ fn test_complete_escrowed_payment_releases_escrow_and_merchant_funds() {
     let admin = Address::generate(&env);
     let amount = 1_000_i128;
 
+    let escrow_admin = Address::generate(&env);
     payment_client.initialize(&admin);
+    escrow_client.initialize(&escrow_admin);
     token_admin_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
 
@@ -3672,4 +3674,582 @@ fn test_batch_payment_events_emitted() {
     let payment = client.get_payment(&results.get(0).unwrap().payment_id);
     assert_eq!(payment.customer, customer);
     assert_eq!(payment.amount, 100_i128);
+}
+
+// ── FEE MANAGEMENT TESTS ─────────────────────────────────────────────────────
+
+fn setup_fee_contract(
+    env: &Env,
+) -> (PaymentContractClient<'_>, Address, Address, Address, Address) {
+    let token_admin = Address::generate(env);
+    let token_contract_id =
+        env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    (client, admin, contract_id, token_contract_id, token_admin)
+}
+
+#[test]
+fn test_set_and_get_fee_config() {
+    let env = Env::default();
+    let (client, admin, _, token_contract_id, _) = setup_fee_contract(&env);
+
+    let treasury = Address::generate(&env);
+    let fee_config = FeeConfig {
+        fee_bps: 30,
+        min_fee: 1,
+        max_fee: 1000,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+
+    client.set_fee_config(&admin, &fee_config);
+
+    let stored = client.get_fee_config();
+    assert_eq!(stored.fee_bps, 30);
+    assert_eq!(stored.treasury, treasury);
+    assert_eq!(stored.active, true);
+    assert_eq!(stored.min_fee, 1);
+    assert_eq!(stored.max_fee, 1000);
+}
+
+#[test]
+fn test_fee_deducted_from_payment_amount() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let amount = 10_000_i128;
+
+    // 30 bps = 0.30% fee
+    let fee_config = FeeConfig {
+        fee_bps: 30,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    // fee = 10_000 * 30 / 10_000 = 30
+    let expected_fee: i128 = 30;
+    let expected_net = amount - expected_fee;
+
+    assert_eq!(token_user_client.balance(&merchant), expected_net);
+    assert_eq!(token_user_client.balance(&contract_id), expected_fee);
+    assert_eq!(client.get_accumulated_fees(), expected_fee);
+}
+
+#[test]
+fn test_fee_min_clamping() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    // A small amount: 10 bps of 100 = 0.1 → rounds to 0, min_fee ensures at least 5
+    let amount = 100_i128;
+
+    let fee_config = FeeConfig {
+        fee_bps: 10,     // 0.10%: raw_fee = 100 * 10 / 10000 = 0
+        min_fee: 5,      // clamped to 5
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    // raw fee = 0, clamped to min_fee = 5
+    assert_eq!(token_user_client.balance(&merchant), amount - 5);
+    assert_eq!(client.get_accumulated_fees(), 5);
+}
+
+#[test]
+fn test_fee_max_clamping() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    // Large amount: 1% of 100_000 = 1000, capped by max_fee = 50
+    let amount = 100_000_i128;
+
+    let fee_config = FeeConfig {
+        fee_bps: 100,   // 1%: raw_fee = 100_000 * 100 / 10_000 = 1000
+        min_fee: 0,
+        max_fee: 50,    // clamped to 50
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    // raw fee = 1000, clamped to max_fee = 50
+    assert_eq!(token_user_client.balance(&merchant), amount - 50);
+    assert_eq!(client.get_accumulated_fees(), 50);
+}
+
+#[test]
+fn test_merchant_tier_upgrade_to_silver() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee_config = FeeConfig {
+        fee_bps: 30,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    // First payment: 10_001 volume → crosses Silver threshold (> 10_000)
+    let amount = 10_001_i128;
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.fee_tier, FeeTier::Silver);
+    assert_eq!(record.total_volume, amount);
+}
+
+#[test]
+fn test_merchant_tier_upgrade_to_gold() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee_config = FeeConfig {
+        fee_bps: 30,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    let amount = 100_001_i128;
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.fee_tier, FeeTier::Gold);
+}
+
+#[test]
+fn test_merchant_tier_upgrade_to_platinum() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee_config = FeeConfig {
+        fee_bps: 30,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    let amount = 1_000_001_i128;
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.fee_tier, FeeTier::Platinum);
+}
+
+#[test]
+fn test_tier_discount_reduces_fee() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee_config = FeeConfig {
+        fee_bps: 1000, // 10%
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    // First: push merchant to Silver (volume > 10_000)
+    let vol_amount = 10_001_i128;
+    let fee1 = 10_001_i128 * 1000 / 10_000; // = 1000 (Standard, no discount)
+    token_client.mint(&customer, &(vol_amount + 10_000));
+    token_user_client.approve(&customer, &contract_id, &(vol_amount + 10_000), &200);
+
+    let pid1 = client.create_payment(
+        &customer,
+        &merchant,
+        &vol_amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &pid1);
+
+    // Merchant should now be Silver (500 bps discount = 5% off fee)
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.fee_tier, FeeTier::Silver);
+
+    // Second payment: effective_bps = 1000 - (1000 * 500 / 10000) = 1000 - 50 = 950
+    // fee = 10_000 * 950 / 10_000 = 950
+    let amount2 = 10_000_i128;
+    let pid2 = client.create_payment(
+        &customer,
+        &merchant,
+        &amount2,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &pid2);
+
+    // fee1 = 1000 (Standard), fee2 = 950 (Silver with 5% discount)
+    let expected_fee2: i128 = 950;
+    let total_fees = fee1 + expected_fee2;
+    assert_eq!(client.get_accumulated_fees(), total_fees);
+
+    let merchant_balance = token_user_client.balance(&merchant);
+    assert_eq!(merchant_balance, (vol_amount - fee1) + (amount2 - expected_fee2));
+}
+
+#[test]
+fn test_withdraw_fees_to_treasury() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let amount = 10_000_i128;
+
+    let fee_config = FeeConfig {
+        fee_bps: 100, // 1%: fee = 100
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let accumulated = client.get_accumulated_fees();
+    assert_eq!(accumulated, 100); // 1% of 10_000
+
+    // Withdraw all fees to treasury
+    client.withdraw_fees(&admin, &accumulated);
+
+    assert_eq!(client.get_accumulated_fees(), 0);
+    assert_eq!(token_user_client.balance(&treasury), accumulated);
+    assert_eq!(token_user_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_withdraw_fees_only_to_treasury_address() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let amount = 10_000_i128;
+
+    let fee_config = FeeConfig {
+        fee_bps: 100,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    // withdraw_fees always uses the treasury from fee config
+    client.withdraw_fees(&admin, &100);
+    assert_eq!(token_user_client.balance(&treasury), 100);
+}
+
+#[test]
+#[should_panic]
+fn test_withdraw_fees_exceeds_accumulated_fails() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let amount = 10_000_i128;
+
+    let fee_config = FeeConfig {
+        fee_bps: 100,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    // Attempt to withdraw more than accumulated (100)
+    client.withdraw_fees(&admin, &999);
+}
+
+#[test]
+fn test_fee_not_collected_when_inactive() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let amount = 10_000_i128;
+
+    // active: false → no fee collected
+    let fee_config = FeeConfig {
+        fee_bps: 100,
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: false,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    assert_eq!(client.get_accumulated_fees(), 0);
+    assert_eq!(token_user_client.balance(&merchant), amount);
+}
+
+#[test]
+fn test_calculate_fee_respects_tier() {
+    let env = Env::default();
+    let (client, admin, _, token_contract_id, _) = setup_fee_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee_config = FeeConfig {
+        fee_bps: 1000, // 10%
+        min_fee: 0,
+        max_fee: 0,
+        treasury: treasury.clone(),
+        fee_token: token_contract_id.clone(),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+
+    // Standard tier: fee = 10_000 * 1000 / 10_000 = 1000
+    let fee_standard = client.calculate_fee(&10_000_i128, &merchant);
+    assert_eq!(fee_standard, 1000);
+}
+
+#[test]
+fn test_get_merchant_fee_record_default() {
+    let env = Env::default();
+    let (client, _, _, _, _) = setup_fee_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let record = client.get_merchant_fee_record(&merchant);
+
+    assert_eq!(record.total_fees_paid, 0);
+    assert_eq!(record.total_volume, 0);
+    assert_eq!(record.fee_tier, FeeTier::Standard);
 }
