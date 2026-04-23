@@ -295,6 +295,67 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "EscrowAnalyticsKey"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "dispute_rate_bps"
+                              },
+                              "val": {
+                                "u32": 10000
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_disputes_initiated"
+                              },
+                              "val": {
+                                "u64": "1"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_disputes_resolved"
+                              },
+                              "val": {
+                                "u64": "0"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_escrows_created"
+                              },
+                              "val": {
+                                "u64": "1"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_escrows_released"
+                              },
+                              "val": {
+                                "u64": "0"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_locked_volume"
+                              },
+                              "val": {
+                                "i128": "1000"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "EscrowCounter"
                             }
                           ]

@@ -27,6 +27,12 @@ pub enum DataKey {
     PoolToken(u64),
     DefaultRefundPolicy,
     RefundPolicy(Address),
+    // Analytics
+    RefundAnalyticsKey,
+    // Pause system
+    PauseStateKey,
+    PauseHistoryEntry(u64),
+    PauseHistoryCount,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +63,8 @@ pub enum Error {
     PolicyInactive = 14,
     QuorumNotReached = 15,
     NotArbitrator = 16,
+    ContractPaused = 17,
+    FunctionPaused = 18,
 }
 
 #[contractevent]
@@ -209,6 +217,68 @@ pub struct RefundPolicyDeactivated {
 pub struct PolicyOverrideApplied {
     pub refund_id: u64,
     pub admin: Address,
+    pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractPausedEvent {
+    pub paused_by: Address,
+    pub reason: String,
+    pub paused_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUnpausedEvent {
+    pub unpaused_by: Address,
+    pub unpaused_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionPausedEvent {
+    pub function_name: String,
+    pub paused_by: Address,
+    pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionUnpausedEvent {
+    pub function_name: String,
+    pub unpaused_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundAnalytics {
+    pub total_refunds_requested: u64,
+    pub total_refunds_approved: u64,
+    pub total_refunds_rejected: u64,
+    pub total_refunds_processed: u64,
+    pub total_refund_volume: i128,
+    pub approval_rate_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PauseState {
+    pub globally_paused: bool,
+    pub paused_functions: Vec<String>,
+    pub paused_at: u64,
+    pub paused_by: Address,
+    pub pause_reason: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PauseHistory {
+    pub index: u64,
+    pub function_name: String,
+    pub paused: bool,
+    pub changed_by: Address,
+    pub changed_at: u64,
     pub reason: String,
 }
 
@@ -1008,6 +1078,221 @@ impl RefundContract {
         env.storage().instance().remove(&DataKey::RefundStatusIndex(refund_id));
         env.storage().instance().set(&DataKey::RefundStatusCount(status), &last_index);
 
+        Ok(())
+    }
+
+    // ── ANALYTICS FUNCTIONS ────────────────────────────────────────────────
+
+    pub fn get_refund_analytics(env: Env) -> RefundAnalytics {
+        env.storage().instance()
+            .get(&DataKey::RefundAnalyticsKey)
+            .unwrap_or(RefundAnalytics {
+                total_refunds_requested: 0, total_refunds_approved: 0,
+                total_refunds_rejected: 0, total_refunds_processed: 0,
+                total_refund_volume: 0, approval_rate_bps: 0,
+            })
+    }
+
+    // ── PAUSE FUNCTIONS ────────────────────────────────────────────────────
+
+    pub fn pause_contract(env: Env, admin: Address, reason: String) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        let now = env.ledger().timestamp();
+        let pause_state = if let Some(mut state) = env.storage().instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            state.globally_paused = true;
+            state.paused_at = now;
+            state.paused_by = admin.clone();
+            state.pause_reason = reason.clone();
+            state
+        } else {
+            PauseState {
+                globally_paused: true,
+                paused_functions: Vec::new(&env),
+                paused_at: now,
+                paused_by: admin.clone(),
+                pause_reason: reason.clone(),
+            }
+        };
+        env.storage().instance().set(&DataKey::PauseStateKey, &pause_state);
+        let history_count: u64 = env.storage().instance()
+            .get(&DataKey::PauseHistoryCount)
+            .unwrap_or(0);
+        let entry = PauseHistory {
+            index: history_count,
+            function_name: String::from_str(&env, "global"),
+            paused: true,
+            changed_by: admin.clone(),
+            changed_at: now,
+            reason: reason.clone(),
+        };
+        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (ContractPausedEvent { paused_by: admin, reason, paused_at: now }).publish(&env);
+        Ok(())
+    }
+
+    pub fn unpause_contract(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        if let Some(mut state) = env.storage().instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            state.globally_paused = false;
+            env.storage().instance().set(&DataKey::PauseStateKey, &state);
+        }
+        let now = env.ledger().timestamp();
+        let history_count: u64 = env.storage().instance()
+            .get(&DataKey::PauseHistoryCount)
+            .unwrap_or(0);
+        let entry = PauseHistory {
+            index: history_count,
+            function_name: String::from_str(&env, "global"),
+            paused: false,
+            changed_by: admin.clone(),
+            changed_at: now,
+            reason: String::from_str(&env, ""),
+        };
+        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (ContractUnpausedEvent { unpaused_by: admin, unpaused_at: now }).publish(&env);
+        Ok(())
+    }
+
+    pub fn pause_function(
+        env: Env,
+        admin: Address,
+        function_name: String,
+        reason: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        let now = env.ledger().timestamp();
+        let mut pause_state = if let Some(state) = env.storage().instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            state
+        } else {
+            PauseState {
+                globally_paused: false,
+                paused_functions: Vec::new(&env),
+                paused_at: 0,
+                paused_by: admin.clone(),
+                pause_reason: String::from_str(&env, ""),
+            }
+        };
+        if !pause_state.paused_functions.contains(&function_name) {
+            pause_state.paused_functions.push_back(function_name.clone());
+        }
+        env.storage().instance().set(&DataKey::PauseStateKey, &pause_state);
+        let history_count: u64 = env.storage().instance()
+            .get(&DataKey::PauseHistoryCount)
+            .unwrap_or(0);
+        let entry = PauseHistory {
+            index: history_count,
+            function_name: function_name.clone(),
+            paused: true,
+            changed_by: admin.clone(),
+            changed_at: now,
+            reason: reason.clone(),
+        };
+        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (FunctionPausedEvent { function_name, paused_by: admin, reason }).publish(&env);
+        Ok(())
+    }
+
+    pub fn unpause_function(
+        env: Env,
+        admin: Address,
+        function_name: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        if let Some(mut state) = env.storage().instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            let mut new_paused = Vec::new(&env);
+            for fn_name in state.paused_functions.iter() {
+                if fn_name != function_name {
+                    new_paused.push_back(fn_name);
+                }
+            }
+            state.paused_functions = new_paused;
+            env.storage().instance().set(&DataKey::PauseStateKey, &state);
+        }
+        let now = env.ledger().timestamp();
+        let history_count: u64 = env.storage().instance()
+            .get(&DataKey::PauseHistoryCount)
+            .unwrap_or(0);
+        let entry = PauseHistory {
+            index: history_count,
+            function_name: function_name.clone(),
+            paused: false,
+            changed_by: admin.clone(),
+            changed_at: now,
+            reason: String::from_str(&env, ""),
+        };
+        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (FunctionUnpausedEvent { function_name, unpaused_by: admin }).publish(&env);
+        Ok(())
+    }
+
+    pub fn get_pause_state(env: Env) -> PauseState {
+        env.storage().instance()
+            .get(&DataKey::PauseStateKey)
+            .unwrap_or(PauseState {
+                globally_paused: false,
+                paused_functions: Vec::new(&env),
+                paused_at: 0,
+                paused_by: env.current_contract_address(),
+                pause_reason: String::from_str(&env, ""),
+            })
+    }
+
+    pub fn is_function_paused(env: Env, function_name: String) -> bool {
+        if let Some(state) = env.storage().instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            if state.globally_paused { return true; }
+            for fn_name in state.paused_functions.iter() {
+                if fn_name == function_name { return true; }
+            }
+        }
+        false
+    }
+
+    fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
+        if let Some(state) = env.storage().instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            if state.globally_paused {
+                return Err(Error::ContractPaused);
+            }
+            let fn_str = String::from_str(env, function_name);
+            for fn_name in state.paused_functions.iter() {
+                if fn_name == fn_str {
+                    return Err(Error::FunctionPaused);
+                }
+            }
+        }
         Ok(())
     }
 }
