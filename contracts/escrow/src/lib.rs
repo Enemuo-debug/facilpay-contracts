@@ -26,6 +26,11 @@ pub enum DataKey {
     TimeLockAction(u64),
     TimeLockCounter,
     TimeLockConfig,
+    // Oracle conditions
+    OracleCondition(u64),
+    // Dispute collateral
+    DisputeConfigKey,
+    DisputeCollateral(u64),
     // Analytics
     EscrowAnalyticsKey,
     CustomerAnalytics(Address),
@@ -37,8 +42,6 @@ pub enum DataKey {
     WatchdogConfig,
     // Reputation decay
     ReputationDecayConfig,
-    // Oracle conditions
-    OracleCondition(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,6 +90,31 @@ pub enum Error {
     OracleStalePriceFeed = 44,
     OracleConditionNotMet = 45,
     NoOracleCondition = 46,
+}
+
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralDeposited {
+    pub escrow_id: u64,
+    pub party: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralForfeited {
+    pub escrow_id: u64,
+    pub party: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralReturned {
+    pub escrow_id: u64,
+    pub party: Address,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -156,6 +184,25 @@ pub struct EvidenceSubmitted {
 pub struct DisputeEscalated {
     pub escrow_id: u64,
     pub level: u64,
+}
+
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeConfig {
+    pub collateral_token: Address,
+    pub collateral_amount: i128,
+    pub collateral_enabled: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeCollateral {
+    pub escrow_id: u64,
+    pub disputing_party: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub deposited_at: u64,
 }
 
 #[contractevent]
@@ -1211,7 +1258,6 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
-        // Check if this is being called from execute_queued_action
         if let Some(config) = env.storage().instance().get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig) {
             if config.admins.contains(&admin) && early_release {
                 // Admin force release requires time-lock
@@ -1368,8 +1414,30 @@ impl EscrowContract {
         let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
 
         // Only customer or merchant can dispute
-        if escrow.customer != caller && escrow.merchant != caller {
+        if caller != escrow.customer && caller != escrow.merchant {
             return Err(Error::Unauthorized);
+        }
+
+        // Handle collateral
+        let config = Self::get_dispute_config(env.clone());
+        if config.collateral_enabled && config.collateral_amount > 0 {
+            let token_client = token::Client::new(&env, &config.collateral_token);
+            token_client.transfer(&caller, &env.current_contract_address(), &config.collateral_amount);
+
+            let collateral = DisputeCollateral {
+                escrow_id,
+                disputing_party: caller.clone(),
+                amount: config.collateral_amount,
+                token: config.collateral_token.clone(),
+                deposited_at: env.ledger().timestamp(),
+            };
+            env.storage().instance().set(&DataKey::DisputeCollateral(escrow_id), &collateral);
+            
+            CollateralDeposited {
+                escrow_id,
+                party: caller.clone(),
+                amount: config.collateral_amount,
+            }.publish(&env);
         }
 
         match escrow.status {
@@ -1570,13 +1638,14 @@ impl EscrowContract {
         release_to_merchant: bool,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "resolve_dispute")?;
 
-        // Check if this is being called from execute_queued_action
         if let Some(config) = env.storage().instance().get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig) {
-            if config.admins.contains(&admin) {
-                // Admin actions require time-lock for sensitive operations
-                return Err(Error::Unauthorized);
+            if !config.admins.contains(&admin) {
+                return Err(Error::NotAnAdmin);
             }
+            // Admin actions require time-lock for sensitive operations
+            return Err(Error::Unauthorized);
         }
 
         Self::internal_resolve_dispute(env, admin, escrow_id, release_to_merchant)
@@ -1610,6 +1679,41 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Transfer main escrow funds
+        let recipient = if release_to_merchant {
+            &escrow.merchant
+        } else {
+            &escrow.customer
+        };
+        Self::transfer_if_token_contract(&env, &escrow.token, recipient, escrow.amount)?;
+
+        // Handle collateral distribution
+        if let Some(collateral) = env.storage().instance().get::<DataKey, DisputeCollateral>(&DataKey::DisputeCollateral(escrow_id)) {
+            let winner = if release_to_merchant {
+                escrow.merchant.clone()
+            } else {
+                escrow.customer.clone()
+            };
+
+            let token_client = token::Client::new(&env, &collateral.token);
+            token_client.transfer(&env.current_contract_address(), &winner, &collateral.amount);
+
+            if winner == collateral.disputing_party {
+                CollateralReturned {
+                    escrow_id,
+                    party: collateral.disputing_party,
+                    amount: collateral.amount,
+                }.publish(&env);
+            } else {
+                CollateralForfeited {
+                    escrow_id,
+                    party: collateral.disputing_party,
+                    amount: collateral.amount,
+                }.publish(&env);
+            }
+            env.storage().instance().remove(&DataKey::DisputeCollateral(escrow_id));
+        }
 
         let (winner, loser) = if release_to_merchant {
             (escrow.merchant.clone(), escrow.customer.clone())
@@ -3106,15 +3210,37 @@ impl EscrowContract {
         if !ms.admins.contains(&admin) {
             return Err(Error::NotAnAdmin);
         }
+        env.storage().instance().set(&DataKey::ReputationDecayConfig, &config);
+        Ok(())
+    }
+
+    pub fn set_dispute_config(env: Env, admin: Address, config: DisputeConfig) -> Result<(), Error> {
+        admin.require_auth();
+        if let Some(ms) = env.storage().instance().get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig) {
+            if !ms.admins.contains(&admin) {
+                return Err(Error::NotAnAdmin);
+            }
+        }
+        env.storage().instance().set(&DataKey::DisputeConfigKey, &config);
+        Ok(())
+    }
+
+    pub fn get_dispute_config(env: Env) -> DisputeConfig {
         env.storage()
             .instance()
-            .set(&DataKey::ReputationDecayConfig, &config);
-        DecayConfigUpdated {
-            decay_rate_bps: config.decay_rate_bps,
-            threshold_days: config.decay_threshold_days,
-        }
-        .publish(&env);
-        Ok(())
+            .get(&DataKey::DisputeConfigKey)
+            .unwrap_or(DisputeConfig {
+                collateral_token: env.current_contract_address(),
+                collateral_amount: 0,
+                collateral_enabled: false,
+            })
+    }
+
+    pub fn get_dispute_collateral(env: Env, escrow_id: u64) -> Result<DisputeCollateral, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DisputeCollateral(escrow_id))
+            .ok_or(Error::InvalidStatus)
     }
 
     pub fn get_effective_reputation(env: Env, address: Address) -> i128 {
@@ -3258,7 +3384,7 @@ impl EscrowContract {
             !condition.release_to_merchant_if_met
         };
 
-        Self::internal_resolve_dispute(env, escrow.customer, escrow_id, release_to_merchant)
+        Self::internal_resolve_dispute(env, escrow.customer.clone(), escrow_id, release_to_merchant)
     }
 
     // ── ANALYTICS HELPERS ─────────────────────────────────────────────────
@@ -3314,3 +3440,6 @@ mod test;
 
 #[cfg(test)]
 mod timelock_test;
+
+#[cfg(test)]
+mod collateral_test;
