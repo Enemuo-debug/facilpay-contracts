@@ -19,7 +19,6 @@ fn test_dispute_collateral_deposit_and_return() {
     let token_admin_client = token::StellarAssetClient::new(&env, &token);
 
     env.ledger().set_timestamp(1000);
-    client.initialize(&admin);
 
     // Setup collateral config
     client.set_dispute_config(&admin, &DisputeConfig {
@@ -70,7 +69,6 @@ fn test_dispute_collateral_forfeiture() {
     let token_admin_client = token::StellarAssetClient::new(&env, &token);
 
     env.ledger().set_timestamp(1000);
-    client.initialize(&admin);
 
     client.set_dispute_config(&admin, &DisputeConfig {
         collateral_token: token.clone(),
@@ -109,7 +107,6 @@ fn test_dispute_without_collateral_when_disabled() {
     let token_client = token::Client::new(&env, &token);
 
     env.ledger().set_timestamp(1000);
-    client.initialize(&admin);
 
     // Collateral disabled
     client.set_dispute_config(&admin, &DisputeConfig {
