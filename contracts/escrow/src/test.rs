@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env, String};
 
 // ── REPUTATION SYSTEM TESTS ──────────────────────────────────────────────────
 
@@ -2297,6 +2297,544 @@ fn test_multisig_resolve_dispute_via_proposal() {
     assert_eq!(escrow.status, EscrowStatus::Resolved);
 }
 
+
+#[test]
+fn test_timelock_cancel_by_any_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin1);
+    client.add_admin(&admin1, &admin2);
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+
+    // admin1 queues the action
+    let action_id = client.queue_action(
+        &admin1,
+        &escrow_id,
+        &EscrowActionType::ForceRelease,
+        &soroban_sdk::Bytes::new(&env),
+    );
+
+    // admin2 (not the proposer) can cancel it
+    client.cancel_queued_action(&admin2, &action_id);
+
+    let action = client.get_queued_action(&action_id);
+    assert!(action.cancelled);
+}
+
+// ── #75 REPUTATION DECAY TESTS ───────────────────────────────────────────────
+
+#[test]
+fn test_update_decay_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let config = ReputationDecayConfig {
+        decay_rate_bps: 200,
+        decay_threshold_days: 7,
+        min_score: 1000,
+        max_score: 9000,
+    };
+    client.update_decay_config(&admin, &config);
+}
+
+#[test]
+fn test_get_effective_reputation_no_decay_within_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    // Set 30-day threshold
+    client.update_decay_config(&admin, &ReputationDecayConfig {
+        decay_rate_bps: 100,
+        decay_threshold_days: 30,
+        min_score: 0,
+        max_score: 10000,
+    });
+
+    // Create and release escrow to give user a score update at t=1000
+    let escrow_id = client.create_escrow(&user, &merchant, &100_i128, &token, &500_u64, &0_u64);
+    let _ = escrow_id; // Score updated at t=1000, default 5000+completion_reward
+
+    // Advance only 10 days — below the 30-day threshold
+    env.ledger().set_timestamp(1000 + 10 * 86400);
+
+    let rep = client.get_reputation(&user);
+    let effective = client.get_effective_reputation(&user);
+
+    // score hasn't changed because no reputation was explicitly set; but effective should match
+    assert_eq!(effective, rep.score as i128);
+}
+
+#[test]
+fn test_get_effective_reputation_decays_after_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    // Set last_updated at t=0
+    env.ledger().set_timestamp(0);
+    client.initialize(&admin);
+
+    // Set threshold to 1 day and rate of 1% per day
+    client.update_decay_config(&admin, &ReputationDecayConfig {
+        decay_rate_bps: 100,
+        decay_threshold_days: 1,
+        min_score: 0,
+        max_score: 10000,
+    });
+
+    // user starts with neutral score (last_updated=0)
+    let user = customer.clone();
+
+    // Advance 11 days past threshold (10 days of decay)
+    env.ledger().set_timestamp(11 * 86400);
+
+    let rep = client.get_reputation(&user); // score=5000, last_updated=0
+    let effective = client.get_effective_reputation(&user);
+
+    // 10 days * 1% per day = 10% of 5000 = 500 decay
+    let expected_decay = (rep.score as i128) * 100 * 10 / 10000;
+    let expected_score = rep.score as i128 - expected_decay;
+    assert_eq!(effective, expected_score);
+    let _ = (merchant, token); // silence unused warnings
+}
+
+#[test]
+fn test_apply_reputation_decay_persists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let user = Address::generate(&env);
+
+    env.ledger().set_timestamp(0);
+    client.update_decay_config(&admin, &ReputationDecayConfig {
+        decay_rate_bps: 100,
+        decay_threshold_days: 1,
+        min_score: 0,
+        max_score: 10000,
+    });
+
+    // Advance 11 days — 10 days of decay at 1% per day
+    env.ledger().set_timestamp(11 * 86400);
+
+    let effective_before = client.get_effective_reputation(&user);
+    client.apply_reputation_decay(&user);
+    let rep_after = client.get_reputation(&user);
+
+    assert_eq!(rep_after.score as i128, effective_before);
+}
+
+#[test]
+fn test_reputation_floor_enforcement() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let user = Address::generate(&env);
+
+    env.ledger().set_timestamp(0);
+    // Very high decay rate + long time → floor should kick in
+    client.update_decay_config(&admin, &ReputationDecayConfig {
+        decay_rate_bps: 10000, // 100% per day
+        decay_threshold_days: 1,
+        min_score: 1000,       // floor at 1000
+        max_score: 10000,
+    });
+
+    // Advance 10 days — would decay by 1000% but floor is 1000
+    env.ledger().set_timestamp(10 * 86400);
+
+    let effective = client.get_effective_reputation(&user);
+    assert_eq!(effective, 1000); // clamped to min_score
+}
+
+// ── #85 ORACLE CONDITION TESTS ───────────────────────────────────────────────
+
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn get_price(env: Env, _feed_id: BytesN<32>) -> OraclePriceData {
+        env.storage()
+            .instance()
+            .get::<u32, OraclePriceData>(&0u32)
+            .expect("price not set")
+    }
+
+    pub fn set_price(env: Env, data: OraclePriceData) {
+        env.storage().instance().set(&0u32, &data);
+    }
+}
+
+#[test]
+fn test_attach_and_get_oracle_condition() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle_id = env.register(MockOracle, ());
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+
+    let condition = OracleCondition {
+        escrow_id,
+        oracle: OracleConfig {
+            oracle_address: oracle_id.clone(),
+            price_feed_id: BytesN::from_array(&env, &[0u8; 32]),
+            staleness_threshold: 3600,
+        },
+        target_price: 1000,
+        comparison: PriceComparison::GreaterThan,
+        release_to_merchant_if_met: true,
+    };
+
+    client.attach_oracle_condition(&admin, &escrow_id, &condition);
+
+    let stored = client.get_oracle_condition(&escrow_id);
+    assert_eq!(stored.target_price, 1000);
+    assert_eq!(stored.release_to_merchant_if_met, true);
+}
+
+#[test]
+fn test_oracle_auto_resolve_condition_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle_id = env.register(MockOracle, ());
+    let oracle_client = MockOracleClient::new(&env, &oracle_id);
+
+    env.ledger().set_timestamp(5000);
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+
+    // Attach condition while escrow is Locked (before dispute)
+    oracle_client.set_price(&OraclePriceData { price: 2000, timestamp: 4500 });
+    let condition = OracleCondition {
+        escrow_id,
+        oracle: OracleConfig {
+            oracle_address: oracle_id,
+            price_feed_id: BytesN::from_array(&env, &[0u8; 32]),
+            staleness_threshold: 3600,
+        },
+        target_price: 1000,
+        comparison: PriceComparison::GreaterThan, // 2000 > 1000 → met
+        release_to_merchant_if_met: true,
+    };
+    client.attach_oracle_condition(&admin, &escrow_id, &condition);
+
+    client.dispute_escrow(&customer, &escrow_id);
+    client.auto_resolve_with_oracle(&escrow_id);
+
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
+    assert_eq!(escrow.status, EscrowStatus::Released); // condition met → merchant
+}
+
+#[test]
+fn test_oracle_auto_resolve_stale_price_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle_id = env.register(MockOracle, ());
+    let oracle_client = MockOracleClient::new(&env, &oracle_id);
+
+    env.ledger().set_timestamp(10000);
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+
+    // Set stale price and attach condition before dispute
+    oracle_client.set_price(&OraclePriceData { price: 2000, timestamp: 0 });
+    let condition = OracleCondition {
+        escrow_id,
+        oracle: OracleConfig {
+            oracle_address: oracle_id,
+            price_feed_id: BytesN::from_array(&env, &[0u8; 32]),
+            staleness_threshold: 3600,
+        },
+        target_price: 1000,
+        comparison: PriceComparison::GreaterThan,
+        release_to_merchant_if_met: true,
+    };
+    client.attach_oracle_condition(&admin, &escrow_id, &condition);
+
+    client.dispute_escrow(&customer, &escrow_id);
+
+    // current time 10000, price timestamp 0, threshold 3600 → stale
+    let result = client.try_auto_resolve_with_oracle(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::OracleStalePriceFeed)));
+}
+
+#[test]
+fn test_oracle_auto_resolve_condition_not_met_releases_to_customer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle_id = env.register(MockOracle, ());
+    let oracle_client = MockOracleClient::new(&env, &oracle_id);
+
+    env.ledger().set_timestamp(5000);
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+
+    // Attach condition while Locked, then dispute
+    oracle_client.set_price(&OraclePriceData { price: 500, timestamp: 4800 });
+    let condition = OracleCondition {
+        escrow_id,
+        oracle: OracleConfig {
+            oracle_address: oracle_id,
+            price_feed_id: BytesN::from_array(&env, &[0u8; 32]),
+            staleness_threshold: 3600,
+        },
+        target_price: 1000,
+        comparison: PriceComparison::GreaterThan, // 500 > 1000 → NOT met
+        release_to_merchant_if_met: true,         // not met → customer
+    };
+    client.attach_oracle_condition(&admin, &escrow_id, &condition);
+
+    client.dispute_escrow(&customer, &escrow_id);
+    client.auto_resolve_with_oracle(&escrow_id);
+
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
+    assert_eq!(escrow.status, EscrowStatus::Resolved); // condition NOT met → customer wins
+}
+
+// ── #86 ANALYTICS TESTS ───────────────────────────────────────────────────────
+
+#[test]
+fn test_analytics_increments_on_create() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    client.create_escrow(&customer, &merchant, &300_i128, &token, &9999_u64, &0_u64);
+
+    let analytics = client.get_escrow_analytics();
+    assert_eq!(analytics.total_escrows_created, 2);
+    assert_eq!(analytics.total_value_locked, 800);
+}
+
+#[test]
+fn test_analytics_dispute_rate_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    let e1 = client.create_escrow(&customer, &merchant, &100_i128, &token, &9999_u64, &0_u64);
+    let e2 = client.create_escrow(&customer, &merchant, &100_i128, &token, &9999_u64, &0_u64);
+    let _ = e2;
+    client.dispute_escrow(&customer, &e1); // 1 dispute out of 2 escrows
+
+    let analytics = client.get_escrow_analytics();
+    assert_eq!(analytics.total_disputes, 1);
+    assert_eq!(analytics.dispute_rate_bps, 5000); // 1/2 * 10000
+}
+
+#[test]
+fn test_per_address_merchant_analytics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let other_merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    // 2 escrows with merchant, 1 with other_merchant
+    client.create_escrow(&customer, &merchant, &200_i128, &token, &9999_u64, &0_u64);
+    client.create_escrow(&customer, &merchant, &300_i128, &token, &9999_u64, &0_u64);
+    client.create_escrow(&customer, &other_merchant, &400_i128, &token, &9999_u64, &0_u64);
+
+    let m_analytics = client.get_merchant_analytics(&merchant);
+    assert_eq!(m_analytics.total_escrows_created, 2);
+    assert_eq!(m_analytics.total_value_locked, 500);
+
+    let other_analytics = client.get_merchant_analytics(&other_merchant);
+    assert_eq!(other_analytics.total_escrows_created, 1);
+    assert_eq!(other_analytics.total_value_locked, 400);
+}
+
+#[test]
+fn test_per_address_customer_analytics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    client.create_escrow(&customer, &merchant, &100_i128, &token, &9999_u64, &0_u64);
+    let e2 = client.create_escrow(&customer, &merchant, &200_i128, &token, &9999_u64, &0_u64);
+    client.dispute_escrow(&customer, &e2);
+
+    let c_analytics = client.get_customer_analytics(&customer);
+    assert_eq!(c_analytics.total_escrows_created, 2);
+    assert_eq!(c_analytics.total_value_locked, 300);
+    assert_eq!(c_analytics.total_disputes, 1);
+}
+
+#[test]
+fn test_reset_analytics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    let before = client.get_escrow_analytics();
+    assert_eq!(before.total_escrows_created, 1);
+
+    client.reset_analytics(&admin);
+
+    let after = client.get_escrow_analytics();
+    assert_eq!(after.total_escrows_created, 0);
+    assert_eq!(after.total_value_locked, 0);
+}
+
+#[test]
+fn test_analytics_avg_duration_updated_on_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    // Set short timelock so we can release via timelock
+    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 86400 });
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &1001_u64, &0_u64);
+
+    let action_id = client.queue_action(
+        &admin,
+        &escrow_id,
+        &EscrowActionType::ForceRelease,
+        &soroban_sdk::Bytes::new(&env),
+    );
+
+    // Advance 4000 seconds past the creation time (1000): total 5000
+    env.ledger().set_timestamp(5000);
+    client.execute_queued_action(&action_id);
+
+    let analytics = client.get_escrow_analytics();
+    assert_eq!(analytics.total_escrows_released, 1);
+    assert_eq!(analytics.total_value_released, 500);
+    // duration = 5000 - 1000 = 4000 seconds
+    assert_eq!(analytics.avg_escrow_duration_seconds, 4000);
+}
+
+// ── #92 WATCHDOG TESTS ───────────────────────────────────────────────────────
+
 #[test]
 fn test_watchdog_release_eligible() {
     let env = Env::default();
@@ -2376,18 +2914,49 @@ fn test_watchdog_premature_trigger() {
     client.initialize(&admin);
 
     client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
+        inactivity_release_seconds: 1000,
         enabled: true,
         favor_customer_on_release: false,
     });
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
 
-    // Before release_timestamp + inactivity
-    env.ledger().set_timestamp(1150);
+    // Before inactivity window (2000 + 1000 = 3000)
+    env.ledger().set_timestamp(2500);
     
     assert!(!client.is_watchdog_eligible(&escrow_id));
     let result = client.try_trigger_watchdog_release(&escrow_id);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_watchdog_favor_customer() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_watchdog_config(&admin, &WatchdogConfig {
+        inactivity_release_seconds: 100,
+        enabled: true,
+        favor_customer_on_release: true, // releases to customer
+    });
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+
+    env.ledger().set_timestamp(1201);
+    
+    client.trigger_watchdog_release(&escrow_id);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
 }
