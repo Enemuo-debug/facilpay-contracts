@@ -2367,6 +2367,122 @@ fn test_multisig_resolve_dispute_via_proposal() {
     assert_eq!(escrow.status, EscrowStatus::Resolved);
 }
 
+#[test]
+fn test_insurance_system() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let config = InsuranceConfig {
+        premium_bps: 100, // 1%
+        max_coverage_bps: 5000, // 50%
+        enabled: true,
+    };
+    client.set_insurance_config(&admin, &config);
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    client.opt_into_insurance(&escrow_id);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.amount, 9900);
+
+    let pool = client.get_insurance_pool();
+    assert_eq!(pool.balance, 100);
+
+    client.refund_escrow(&customer, &escrow_id);
+    
+    let claim_id = client.file_insurance_claim(&admin, &escrow_id, &100_i128);
+    assert_eq!(claim_id, 1);
+
+    client.approve_claim(&admin, &claim_id);
+    
+    let final_pool = client.get_insurance_pool();
+    assert_eq!(final_pool.balance, 0);
+    assert_eq!(final_pool.total_claims_paid, 100);
+}
+
+// ── #74 TIMELOCK TESTS ───────────────────────────────────────────────────────
+
+#[test]
+fn test_timelock_execute_after_expiry_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    // Set a short timelock (1 hour delay, 1 hour grace)
+    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 3600 });
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let action_id = client.queue_action(
+        &admin,
+        &escrow_id,
+        &EscrowActionType::ResolveDispute(true),
+        &soroban_sdk::Bytes::new(&env),
+    );
+
+    // Advance past grace period (delay 3600 + grace 3600 = 7200 seconds)
+    env.ledger().set_timestamp(1000 + 7201);
+
+    let result = client.try_execute_queued_action(&action_id);
+    assert_eq!(result, Err(Ok(Error::ActionExpired)));
+}
+
+#[test]
+fn test_timelock_execute_after_delay_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+
+    // Set a 1-hour timelock, 24-hour grace period
+    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 86400 });
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let action_id = client.queue_action(
+        &admin,
+        &escrow_id,
+        &EscrowActionType::ResolveDispute(true),
+        &soroban_sdk::Bytes::new(&env),
+    );
+
+    // Advance past delay but within grace period
+    env.ledger().set_timestamp(1000 + 3601);
+
+    client.execute_queued_action(&action_id);
+
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
 
 
 
@@ -2990,12 +3106,37 @@ fn setup_vesting_with_milestones(
 fn test_approve_milestone_success() {
     let env = Env::default();
     env.ledger().set_timestamp(1000);
+#[test]
+fn test_insurance_underfunded() {
+    let env = Env::default();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_insurance_config(&admin, &InsuranceConfig {
+        premium_bps: 10,
+        max_coverage_bps: 1000,
+        enabled: true,
+    });
+
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
+    client.opt_into_insurance(&escrow_id);
+
+    client.refund_escrow(&customer, &escrow_id);
+    
+    let claim_id = client.file_insurance_claim(&admin, &escrow_id, &50_i128);
+    let result = client.try_approve_claim(&admin, &claim_id);
+    
+    assert!(result.is_err());
+}
+
 // ── #92 WATCHDOG TESTS ───────────────────────────────────────────────────────
 
 #[test]
