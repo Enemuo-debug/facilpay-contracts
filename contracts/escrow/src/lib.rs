@@ -42,6 +42,10 @@ pub enum DataKey {
     // Multi-token escrow
     MultiTokenEscrow(u64),
     MultiTokenEscrowCounter,
+    InsurancePool,
+    InsuranceConfig,
+    InsuranceClaim(u64),
+    InsuranceClaimCounter,
     WatchdogConfig,
     // Reputation decay
     ReputationDecayConfig,
@@ -54,6 +58,32 @@ pub enum EscrowStatus {
     Released,
     Disputed,
     Resolved,
+    Cancelled,
+}
+
+#[contracttype]
+pub struct InsurancePool {
+    pub token: Address,
+    pub balance: i128,
+    pub total_premiums_collected: i128,
+    pub total_claims_paid: i128,
+}
+
+#[contracttype]
+pub struct InsuranceConfig {
+    pub premium_bps: i128,
+    pub max_coverage_bps: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+pub struct InsuranceClaim {
+    pub claim_id: u64,
+    pub escrow_id: u64,
+    pub claimant: Address,
+    pub amount: i128,
+    pub approved: bool,
+    pub paid_at: Option<u64>,
 }
 
 #[contracterror]
@@ -93,9 +123,14 @@ pub enum Error {
     EmptyTokenList = 35,
     DuplicateToken = 36,
     TokenTransferPartialFailure = 37,
+    Underfunded = 32,
+    NotClaimable = 33,
     OracleStalePriceFeed = 44,
     OracleConditionNotMet = 45,
     NoOracleCondition = 46,
+    MilestoneNotFound = 47,
+    MilestoneNotApproved = 48,
+    MilestoneOverflow = 49,
 }
 
 
@@ -265,8 +300,16 @@ pub struct VestedAmountReleased {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MilestoneReleased {
     pub escrow_id: u64,
-    pub milestone_index: u32,
+    pub milestone_id: u64,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneApproved {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub approved_by: Address,
 }
 
 #[contractevent]
@@ -397,10 +440,13 @@ pub struct Evidence {
 #[derive(Clone)]
 #[contracttype]
 pub struct VestingMilestone {
+    pub milestone_id: u64,
     pub unlock_timestamp: u64,
     pub amount: i128,
     pub released: bool,
     pub description: String,
+    pub approved_by: Option<Address>,
+    pub approved_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1437,6 +1483,8 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
+        // Check if this is being called from execute_queued_action
+
         if let Some(config) = env.storage().instance().get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig) {
             if config.admins.contains(&admin) && early_release {
                 // Admin force release requires time-lock
@@ -1479,6 +1527,7 @@ impl EscrowContract {
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::InvalidStatus),
             EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
         }
 
         env.storage()
@@ -1558,7 +1607,7 @@ impl EscrowContract {
             EscrowStatus::Locked | EscrowStatus::Disputed => {
                 escrow.status = EscrowStatus::Resolved;
             }
-            EscrowStatus::Released | EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
         }
 
         env.storage()
@@ -1628,6 +1677,7 @@ impl EscrowContract {
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::AlreadyProcessed),
             EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
         }
 
         env.storage()
@@ -2261,6 +2311,15 @@ impl EscrowContract {
             .set(&DataKey::EscrowCounter, &escrow_id);
 
         // Create and store the vesting schedule
+        // Assign sequential milestone_ids if not already set
+        let mut indexed_milestones = Vec::new(&env);
+        for (i, mut m) in milestones.iter().enumerate() {
+            if m.milestone_id == 0 {
+                m.milestone_id = (i as u64) + 1;
+            }
+            indexed_milestones.push_back(m);
+        }
+
         let vesting_schedule = VestingSchedule {
             escrow_id,
             total_amount: amount,
@@ -2268,7 +2327,7 @@ impl EscrowContract {
             start_timestamp: current_timestamp,
             cliff_timestamp,
             end_timestamp,
-            milestones,
+            milestones: indexed_milestones,
         };
 
         env.storage()
@@ -2470,11 +2529,12 @@ impl EscrowContract {
                 {
                     milestone.released = true;
                     let amount = milestone.amount;
+                    let mid = milestone.milestone_id;
                     milestones_vec.set(i, milestone);
 
                     MilestoneReleased {
                         escrow_id,
-                        milestone_index: i as u32,
+                        milestone_id: mid,
                         amount,
                     }
                     .publish(&env);
@@ -2496,6 +2556,217 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(releasable_amount)
+    }
+
+    /// Admin approves a specific milestone, enabling it to be released.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    /// * `MilestoneNotFound` - No milestone with the given ID
+    /// * `MilestoneAlreadyReleased` - Milestone was already released
+    /// * `NotAnAdmin` - Caller is not a registered admin
+    pub fn approve_milestone(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        milestone_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let mut found = false;
+        let mut milestones = vesting_schedule.milestones.clone();
+        for i in 0..milestones.len() {
+            let mut m = milestones.get(i).unwrap();
+            if m.milestone_id == milestone_id {
+                found = true;
+                if m.released {
+                    return Err(Error::MilestoneAlreadyReleased);
+                }
+                let now = env.ledger().timestamp();
+                m.approved_by = Some(admin.clone());
+                m.approved_at = Some(now);
+                milestones.set(i, m);
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::MilestoneNotFound);
+        }
+
+        vesting_schedule.milestones = milestones;
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        MilestoneApproved {
+            escrow_id,
+            milestone_id,
+            approved_by: admin,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Releases a specific approved milestone's amount to the merchant.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    /// * `MilestoneNotFound` - No milestone with the given ID
+    /// * `MilestoneNotApproved` - Milestone has not been approved by an admin
+    /// * `MilestoneAlreadyReleased` - Milestone was already released
+    /// * `MilestoneOverflow` - Release would exceed the escrow's locked amount
+    pub fn release_milestone(env: Env, escrow_id: u64, milestone_id: u64) -> Result<i128, Error> {
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let mut found = false;
+        let mut release_amount: i128 = 0;
+        let mut milestones = vesting_schedule.milestones.clone();
+
+        for i in 0..milestones.len() {
+            let mut m = milestones.get(i).unwrap();
+            if m.milestone_id == milestone_id {
+                found = true;
+                if m.released {
+                    return Err(Error::MilestoneAlreadyReleased);
+                }
+                if m.approved_by.is_none() {
+                    return Err(Error::MilestoneNotApproved);
+                }
+                // Guard: total released must not exceed locked amount
+                let new_total = vesting_schedule.released_amount.saturating_add(m.amount);
+                if new_total > vesting_schedule.total_amount {
+                    return Err(Error::MilestoneOverflow);
+                }
+                release_amount = m.amount;
+                m.released = true;
+                milestones.set(i, m);
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::MilestoneNotFound);
+        }
+
+        vesting_schedule.milestones = milestones;
+        vesting_schedule.released_amount = vesting_schedule
+            .released_amount
+            .saturating_add(release_amount);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        // Transfer to merchant
+        EscrowContract::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &escrow.merchant,
+            release_amount,
+        )?;
+
+        MilestoneReleased {
+            escrow_id,
+            milestone_id,
+            amount: release_amount,
+        }
+        .publish(&env);
+
+        Ok(release_amount)
+    }
+
+    /// Returns all milestones that have not yet been released.
+    pub fn get_pending_milestones(env: Env, escrow_id: u64) -> Vec<VestingMilestone> {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+        {
+            Some(s) => s,
+            None => return Vec::new(&env),
+        };
+
+        let mut pending = Vec::new(&env);
+        for m in vesting_schedule.milestones.iter() {
+            if !m.released {
+                pending.push_back(m);
+            }
+        }
+        pending
+    }
+
+    /// Adds a new milestone to an existing vesting schedule.
+    /// The new milestone's amount must not cause total milestone amounts to exceed the escrow's
+    /// locked amount.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    /// * `MilestoneOverflow` - Adding this milestone would exceed the locked amount
+    /// * `NotAnAdmin` - Caller is not a registered admin
+    pub fn add_milestone(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        milestone: VestingMilestone,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        // Sum existing milestone amounts
+        let mut existing_total: i128 = 0;
+        for m in vesting_schedule.milestones.iter() {
+            existing_total = existing_total.saturating_add(m.amount);
+        }
+
+        if existing_total.saturating_add(milestone.amount) > vesting_schedule.total_amount {
+            return Err(Error::MilestoneOverflow);
+        }
+
+        // Auto-assign milestone_id if not provided
+        let mut new_milestone = milestone;
+        if new_milestone.milestone_id == 0 {
+            new_milestone.milestone_id = (vesting_schedule.milestones.len() as u64) + 1;
+        }
+
+        vesting_schedule.milestones.push_back(new_milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        Ok(())
     }
 
     // For existing tests that use synthetic token addresses, transfer calls are skipped when the
@@ -2577,6 +2848,7 @@ impl EscrowContract {
                     EscrowStatus::Released => return Err(Error::AlreadyProcessed),
                     EscrowStatus::Disputed => return Err(Error::InvalidStatus),
                     EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+                    EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
                 }
 
                 env.storage()
@@ -2985,9 +3257,10 @@ impl EscrowContract {
         if !config.admins.contains(&admin) {
             return Err(Error::NotAnAdmin);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowAnalyticsKey, &EscrowAnalytics::default_value());
+        env.storage().instance().set(
+            &DataKey::EscrowAnalyticsKey,
+            &EscrowAnalytics::default_value(),
+        );
         let now = env.ledger().timestamp();
         AnalyticsReset {
             reset_by: admin,
@@ -3284,9 +3557,19 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::TimeLockConfig)
             .unwrap_or(TimeLockConfig {
-                delay: 86400,        // 24 hours default
-                grace_period: 86400, // 24 hours default
+                delay: 86400,
+                grace_period: 86400,
             })
+    }
+
+    pub fn set_insurance_config(env: Env, admin: Address, config: InsuranceConfig) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::InsuranceConfig, &config);
+        Ok(())
     }
 
     pub fn set_watchdog_config(env: Env, admin: Address, config: WatchdogConfig) -> Result<(), Error> {
@@ -3296,6 +3579,94 @@ impl EscrowContract {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&DataKey::WatchdogConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_insurance_pool(env: Env) -> InsurancePool {
+        env.storage()
+            .instance()
+            .get(&DataKey::InsurancePool)
+            .unwrap_or(InsurancePool {
+                token: env.current_contract_address(), // dummy default
+                balance: 0,
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+            })
+    }
+
+    pub fn opt_into_insurance(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let config: InsuranceConfig = env.storage().instance().get(&DataKey::InsuranceConfig).ok_or(Error::Unauthorized)?;
+        if !config.enabled { return Err(Error::Unauthorized); }
+
+        let mut escrow = Self::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked { return Err(Error::InvalidStatus); }
+
+        let premium = (escrow.amount * config.premium_bps) / 10000;
+        if premium == 0 { return Ok(()); }
+
+        escrow.amount -= premium;
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        let mut pool = Self::get_insurance_pool(env.clone());
+        pool.token = escrow.token.clone();
+        pool.balance += premium;
+        pool.total_premiums_collected += premium;
+        env.storage().instance().set(&DataKey::InsurancePool, &pool);
+
+        Ok(())
+    }
+
+    pub fn file_insurance_claim(env: Env, admin: Address, escrow_id: u64, amount: i128) -> Result<u64, Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) { return Err(Error::Unauthorized); }
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Resolved && escrow.status != EscrowStatus::Cancelled {
+            return Err(Error::NotClaimable);
+        }
+
+        let config: InsuranceConfig = env.storage().instance().get(&DataKey::InsuranceConfig).ok_or(Error::Unauthorized)?;
+        let max_coverage = (escrow.amount * config.max_coverage_bps) / 10000;
+        if amount > max_coverage { return Err(Error::Unauthorized); }
+
+        let counter: u64 = env.storage().instance().get(&DataKey::InsuranceClaimCounter).unwrap_or(0) + 1;
+        let claim = InsuranceClaim {
+            claim_id: counter,
+            escrow_id,
+            claimant: escrow.customer.clone(), // default to customer
+            amount,
+            approved: false,
+            paid_at: None,
+        };
+
+        env.storage().instance().set(&DataKey::InsuranceClaim(counter), &claim);
+        env.storage().instance().set(&DataKey::InsuranceClaimCounter, &counter);
+
+        Ok(counter)
+    }
+
+    pub fn approve_claim(env: Env, admin: Address, claim_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) { return Err(Error::Unauthorized); }
+
+        let mut claim: InsuranceClaim = env.storage().instance().get(&DataKey::InsuranceClaim(claim_id)).ok_or(Error::EscrowNotFound)?;
+        if claim.approved { return Err(Error::AlreadyProcessed); }
+
+        let mut pool = Self::get_insurance_pool(env.clone());
+        if pool.balance < claim.amount { return Err(Error::Underfunded); }
+
+        Self::transfer_if_token_contract(&env, &pool.token, &claim.claimant, claim.amount)?;
+
+        pool.balance -= claim.amount;
+        pool.total_claims_paid += claim.amount;
+        env.storage().instance().set(&DataKey::InsurancePool, &pool);
+
+        claim.approved = true;
+        claim.paid_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::InsuranceClaim(claim_id), &claim);
+
         Ok(())
     }
 
@@ -3340,19 +3711,7 @@ impl EscrowContract {
 
         let config = Self::get_watchdog_config(env.clone());
         let mut escrow = Self::get_escrow(&env, escrow_id);
-        let _triggered_by = env.current_contract_address(); // Or should it be the caller? The requirement says "callable by any address". 
-        // In Soroban, if no require_auth, anyone can call.
-        // The event says `triggered_by: Address`. I'll use `env.current_contract_address()` or a way to get the immediate caller?
-        // Actually, I'll use a dummy address if I don't want to require auth, or I can use an optional auth.
-        // But the requirement says "callable by any address".
-        // I'll try to get the caller if possible, or just use contract address for now.
-        // Wait, I can't easily get the caller without `require_auth` or passing it as argument.
-        // The function signature in the request is `pub fn trigger_watchdog_release(env: Env, escrow_id: u64) -> Result<(), Error>`.
-        // So I can't have a `caller` argument unless I change the signature.
-        // I'll use `env.current_contract_address()` for `triggered_by` if I can't get the caller.
-        // Actually, I can use `env.storage().instance().bump()` as a side effect to see who called? No.
-        // I'll just use the contract address for the event if the signature must match.
-
+        
         let released_to = if config.favor_customer_on_release {
             escrow.customer.clone()
         } else {
@@ -3372,7 +3731,7 @@ impl EscrowContract {
         WatchdogReleaseTriggered {
             escrow_id,
             released_to: released_to.clone(),
-            triggered_by: env.current_contract_address(), // Better than nothing
+            triggered_by: env.current_contract_address(),
         }.publish(&env);
 
         Ok(())
