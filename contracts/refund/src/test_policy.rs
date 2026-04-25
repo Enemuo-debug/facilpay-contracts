@@ -405,3 +405,208 @@ fn test_refund_policy_deactivated_event_emitted() {
     let events = env.events().all();
     assert!(events.len() > 0);
 }
+
+// ── Issue #93: Default refund policy tests ────────────────────────────────
+
+#[test]
+fn test_set_default_refund_policy_by_admin_succeeds() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    let policy = RefundPolicy {
+        merchant: admin.clone(),
+        refund_window: 7 * 24 * 60 * 60, // 7 days
+        max_refund_percentage: 5000,       // 50 %
+        requires_admin_approval: true,
+        auto_approve_below: 0,
+        active: true,
+    };
+
+    client.set_default_refund_policy(&admin, &policy);
+
+    let stored = client.get_default_refund_policy();
+    assert!(stored.is_some());
+    let stored = stored.unwrap();
+    assert_eq!(stored.refund_window, 7 * 24 * 60 * 60);
+    assert_eq!(stored.max_refund_percentage, 5000);
+}
+
+#[test]
+#[should_panic]
+fn test_set_default_refund_policy_by_non_admin_fails() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    let policy = RefundPolicy {
+        merchant: attacker.clone(),
+        refund_window: 7 * 24 * 60 * 60,
+        max_refund_percentage: 10000,
+        requires_admin_approval: true,
+        auto_approve_below: 0,
+        active: true,
+    };
+
+    // attacker != stored admin → should panic with Unauthorized
+    client.set_default_refund_policy(&attacker, &policy);
+}
+
+#[test]
+fn test_remove_default_refund_policy_by_admin_succeeds() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    // A default policy is set by initialize(); remove it
+    client.remove_default_refund_policy(&admin);
+
+    let stored = client.get_default_refund_policy();
+    assert!(stored.is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_remove_default_refund_policy_by_non_admin_fails() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    client.remove_default_refund_policy(&attacker);
+}
+
+#[test]
+fn test_request_refund_uses_global_default_when_no_merchant_policy() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    // Replace the default with a custom global policy (no admin approval, auto-approve <= 200)
+    let default_policy = RefundPolicy {
+        merchant: admin.clone(),
+        refund_window: 30 * 24 * 60 * 60,
+        max_refund_percentage: 10000,
+        requires_admin_approval: false,
+        auto_approve_below: 200,
+        active: true,
+    };
+    client.set_default_refund_policy(&admin, &default_policy);
+
+    // No merchant-specific policy set; amount (100) <= auto_approve_below (200) → auto-approved
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &100i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "Uses global default"),
+        &env.ledger().timestamp(),
+    );
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Approved);
+}
+
+#[test]
+fn test_request_refund_returns_policy_not_found_when_no_policy_at_all() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    // Remove the default policy that initialize() set, and set NO merchant policy
+    client.remove_default_refund_policy(&admin);
+
+    let result = client.try_request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &500i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "No policy at all"),
+        &env.ledger().timestamp(),
+    );
+
+    assert_eq!(result, Err(Ok(Error::PolicyNotFound)));
+}
+
+#[test]
+fn test_default_policy_change_does_not_affect_pending_refunds() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin);
+    env.mock_all_auths();
+
+    // Submit a refund using the current default (set by initialize())
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &500i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "Pending refund"),
+        &env.ledger().timestamp(),
+    );
+
+    // Verify it is in Requested state (default requires admin approval)
+    let refund_before = client.get_refund(&refund_id);
+    assert_eq!(refund_before.status, RefundStatus::Requested);
+
+    // Now admin changes the global default policy
+    let new_default = RefundPolicy {
+        merchant: admin.clone(),
+        refund_window: 7 * 24 * 60 * 60,
+        max_refund_percentage: 5000,
+        requires_admin_approval: false,
+        auto_approve_below: 1000,
+        active: true,
+    };
+    client.set_default_refund_policy(&admin, &new_default);
+
+    // The already-stored refund must NOT be retroactively changed
+    let refund_after = client.get_refund(&refund_id);
+    assert_eq!(refund_after.status, RefundStatus::Requested);
+}
