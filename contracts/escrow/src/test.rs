@@ -4175,9 +4175,3 @@ fn test_batch_escrow_creation_unauthorized() {
     assert!(!results.get(0).unwrap().success);
     assert_eq!(results.get(0).unwrap().error_code, Error::NotAnAdmin as u32);
 }
-    let escrow_1 = client.get_escrow(&escrow_id_before);
-    let escrow_2 = client.get_escrow(&escrow_id_after);
-
-    assert_eq!(escrow_1.fee_bps, 0);
-    assert_eq!(escrow_2.fee_bps, 1000);
-}

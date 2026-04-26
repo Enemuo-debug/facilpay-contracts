@@ -5003,6 +5003,8 @@ fn test_grant_fee_waiver() {
         .filter(|e| e.topics[0] == "FeeWaiverGranted")
         .collect();
     assert_eq!(waiver_events.len(), 1);
+}
+
 // ── LARGE PAYMENT MULTI-SIG TESTS ───────────────────────────────────────────
 
 fn setup_large_payment_contract(env: &Env) -> (PaymentContractClient<'_>, Address, Address, Address) {
@@ -5297,6 +5299,10 @@ fn test_fee_waiver_events() {
         .filter(|e| e.topics[0] == "FeeWaiverRevoked")
         .collect();
     assert_eq!(revoke_events.len(), 1);
+}
+
+#[test]
+#[should_panic]
 fn test_set_large_payment_threshold_unauthorized() {
     let env = Env::default();
     let (client, admin, admin2, _) = setup_large_payment_contract(&env);
