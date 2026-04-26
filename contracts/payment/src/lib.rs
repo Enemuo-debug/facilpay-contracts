@@ -15,7 +15,7 @@ pub enum DataKey {
     MerchantPayments(Address, u64),
     CustomerPaymentCount(Address),
     MerchantPaymentCount(Address),
-    PaymentNotes(u64),
+    PaymentMetadata(u64), // replaces PaymentNotes
     ConversionRate(Currency),
     SubscriptionCounter,
     Subscription(u64),
@@ -196,6 +196,9 @@ pub enum Error {
     PaymentRequiresMultiSig = 64,
     InsufficientPaymentApprovals = 65,
     PaymentProposalExpired = 66,
+    MetadataAlreadySet = 67,
+    MetadataNotFound = 68,
+    HashMismatch = 69,
 }
 
 #[contractevent]
@@ -754,6 +757,35 @@ pub struct LargePaymentExecuted {
 pub struct LargePaymentThresholdUpdated {
     pub threshold: i128,
     pub updated_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMetadataSet {
+    pub payment_id: u64,
+    pub content_ref: String,
+    pub encrypted: bool,
+    pub set_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMetadataUpdated {
+    pub payment_id: u64,
+    pub content_ref: String,
+    pub updated_by: Address,
+    pub version: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentMetadata {
+    pub payment_id: u64,
+    pub content_ref: String,        // IPFS CID or similar
+    pub content_hash: BytesN<32>,   // SHA-256 of plaintext for verification
+    pub encrypted: bool,
+    pub updated_at: u64,
+    pub version: u32,
 }
 
 #[derive(Clone)]
@@ -5280,6 +5312,113 @@ impl PaymentContract {
             .get(&DataKey::LargePaymentProposal(payment_id))
             .expect("Large payment proposal not found")
     }
+
+    /// Set payment metadata with encrypted content reference
+    /// Only payment customer, merchant, or admin can set metadata
+    /// Content hash is immutable after first set
+    pub fn set_payment_metadata(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+        content_ref: String,
+        content_hash: BytesN<32>,
+        encrypted: bool,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Verify caller is customer, merchant, or admin
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != payment.customer && caller != payment.merchant && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if metadata already exists
+        let existing_metadata: Option<PaymentMetadata> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMetadata(payment_id));
+
+        if let Some(existing) = existing_metadata {
+            // Metadata already set - emit update event with new version
+            let new_version = existing.version + 1;
+            let updated_metadata = PaymentMetadata {
+                payment_id,
+                content_ref: content_ref.clone(),
+                content_hash: existing.content_hash, // Keep original hash immutable
+                encrypted,
+                updated_at: env.ledger().timestamp(),
+                version: new_version,
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentMetadata(payment_id), &updated_metadata);
+
+            PaymentMetadataUpdated {
+                payment_id,
+                content_ref,
+                updated_by: caller,
+                version: new_version,
+            }
+            .publish(&env);
+        } else {
+            // First time setting metadata
+            let metadata = PaymentMetadata {
+                payment_id,
+                content_ref: content_ref.clone(),
+                content_hash,
+                encrypted,
+                updated_at: env.ledger().timestamp(),
+                version: 1,
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentMetadata(payment_id), &metadata);
+
+            PaymentMetadataSet {
+                payment_id,
+                content_ref,
+                encrypted,
+                set_by: caller,
+            }
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
+    /// Get payment metadata
+    pub fn get_payment_metadata(env: Env, payment_id: u64) -> Option<PaymentMetadata> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentMetadata(payment_id))
+    }
+
+    /// Verify metadata integrity by comparing provided hash against stored hash
+    /// Returns true if hashes match, false otherwise
+    pub fn verify_metadata_integrity(
+        env: Env,
+        payment_id: u64,
+        plaintext_hash: BytesN<32>,
+    ) -> bool {
+        let metadata: Option<PaymentMetadata> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMetadata(payment_id));
+
+        match metadata {
+            Some(meta) => meta.content_hash == plaintext_hash,
+            None => false,
+        }
+    }
 }
 
 mod test;
@@ -5291,4 +5430,5 @@ mod test_analytics;
 mod test_trial;
 
 #[cfg(test)]
+mod test_metadata;
 mod test_issue_113_115_119_120;

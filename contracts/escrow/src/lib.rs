@@ -4634,8 +4634,8 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0,
-            fee_bps,
+            min_hold_period: 0, // Default for batch
+            fee_bps: 0, // Default fee
         };
 
         env.storage()
