@@ -251,6 +251,19 @@ pub struct RefundPolicyDeactivated {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefaultRefundPolicySet {
+    pub set_by: Address,
+    pub refund_window: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefaultRefundPolicyRemoved {
+    pub removed_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyOverrideApplied {
     pub refund_id: u64,
     pub admin: Address,
@@ -438,15 +451,19 @@ impl RefundContract {
         let counter: u64 = env.storage().instance().get(&DataKey::RefundCounter).unwrap_or(0);
         let refund_id = counter + 1;
 
-        // Determine initial status based on policy
-        let initial_status = if let Some(policy) = Self::get_refund_policy(&env, merchant.clone()) {
-            if !policy.requires_admin_approval && amount <= policy.auto_approve_below {
-                RefundStatus::Approved
+        // Determine initial status based on policy (merchant → global default → Requested)
+        let initial_status = {
+            let policy_opt = Self::get_refund_policy(&env, merchant.clone())
+                .or_else(|| Self::get_default_refund_policy_inner(&env));
+            if let Some(policy) = policy_opt {
+                if !policy.requires_admin_approval && amount <= policy.auto_approve_below {
+                    RefundStatus::Approved
+                } else {
+                    RefundStatus::Requested
+                }
             } else {
                 RefundStatus::Requested
             }
-        } else {
-            RefundStatus::Requested
         };
 
         // Create Refund struct
@@ -1098,6 +1115,66 @@ impl RefundContract {
         env.storage().instance().get(&DataKey::RefundPolicy(merchant))
     }
 
+    // ── Issue #93: Default refund policy management ────────────────────────
+
+    /// Set the global default refund policy. Admin-only.
+    pub fn set_default_refund_policy(
+        env: Env,
+        admin: Address,
+        policy: RefundPolicy,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultRefundPolicy, &policy);
+        (DefaultRefundPolicySet {
+            set_by: admin,
+            refund_window: policy.refund_window,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Get the global default refund policy (returns None if not set).
+    pub fn get_default_refund_policy(env: Env) -> Option<RefundPolicy> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultRefundPolicy)
+    }
+
+    /// Internal helper used by request_refund / validate_against_policy.
+    fn get_default_refund_policy_inner(env: &Env) -> Option<RefundPolicy> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultRefundPolicy)
+    }
+
+    /// Remove the global default refund policy. Admin-only.
+    pub fn remove_default_refund_policy(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::DefaultRefundPolicy);
+        (DefaultRefundPolicyRemoved { removed_by: admin }).publish(&env);
+        Ok(())
+    }
+
     pub fn deactivate_refund_policy(env: Env, merchant: Address) -> Result<(), Error> {
         // Require merchant authentication
         merchant.require_auth();
@@ -1164,24 +1241,10 @@ impl RefundContract {
         original_amount: i128,
         payment_created_at: u64
     ) -> Result<(), Error> {
-        // Get merchant-specific policy or default
-        let policy: RefundPolicy = if
-            let Some(merchant_policy) = Self::get_refund_policy(env, merchant.clone())
-        {
-            merchant_policy
-        } else {
-            env.storage()
-                .instance()
-                .get(&DataKey::DefaultRefundPolicy)
-                .unwrap_or_else(|| RefundPolicy {
-                    merchant: merchant.clone(),
-                    refund_window: 30 * 24 * 60 * 60, // 30 days
-                    max_refund_percentage: 10000, // 100%
-                    requires_admin_approval: true,
-                    auto_approve_below: 0,
-                    active: true,
-                })
-        };
+        // Fallback chain: merchant policy → global default → PolicyNotFound
+        let policy: RefundPolicy = Self::get_refund_policy(env, merchant.clone())
+            .or_else(|| Self::get_default_refund_policy_inner(env))
+            .ok_or(Error::PolicyNotFound)?;
 
         // Check if policy is active
         if !policy.active {
