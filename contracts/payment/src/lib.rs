@@ -30,6 +30,7 @@ pub enum DataKey {
     DunningConfig,
     DunningState(u64),
     EscrowedPayment(u64),
+    EscrowedPaymentDispute(u64),
     ConditionalPayment(u64),
     MultiSigConfig,
     AdminProposal(String),
@@ -265,6 +266,20 @@ pub struct EscrowedPaymentCancelled {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowedPaymentDisputed {
+    pub payment_id: u64,
+    pub raised_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowedPaymentDisputeResolved {
+    pub payment_id: u64,
+    pub favor_customer: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionCreated {
     pub subscription_id: u64,
     pub customer: Address,
@@ -441,6 +456,18 @@ pub struct EscrowedPayment {
     pub escrow_id: u64,
     pub escrow_contract: Address,
     pub auto_release_on_complete: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowedPaymentDispute {
+    pub payment_id: u64,
+    pub raised_by: Address,
+    pub reason: String,
+    pub raised_at: u64,
+    pub resolved: bool,
+    pub resolved_at: Option<u64>,
+    pub favor_customer: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -1576,7 +1603,7 @@ impl PaymentContract {
         (PaymentCreated {
             payment_id,
             customer: payment.customer,
-            merchant: payment.merchant,
+            merchant: payment.merchant.clone(),
             amount: payment.amount,
         })
         .publish(&env);
@@ -1684,6 +1711,7 @@ impl PaymentContract {
         if payment.status != PaymentStatus::Pending {
             return Err(Error::InvalidStatus);
         }
+        PaymentContract::require_no_unresolved_escrowed_payment_dispute(&env, payment_id)?;
 
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
         if escrow_client
@@ -1724,6 +1752,7 @@ impl PaymentContract {
         if payment.customer != caller && payment.merchant != caller {
             return Err(Error::Unauthorized);
         }
+        PaymentContract::require_no_unresolved_escrowed_payment_dispute(&env, payment_id)?;
 
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
         if escrow_client
@@ -1746,11 +1775,157 @@ impl PaymentContract {
         Ok(())
     }
 
+    pub fn dispute_escrowed_payment(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+        reason: String,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if payment.customer != caller && payment.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+        if let Some(dispute) =
+            PaymentContract::get_escrowed_payment_dispute(env.clone(), payment_id)
+        {
+            if !dispute.resolved {
+                return Err(Error::AlreadyProcessed);
+            }
+        }
+
+        let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
+        if escrow_client
+            .try_dispute_escrow(&caller, &bridge.escrow_id)
+            .is_err()
+        {
+            return Err(Error::EscrowBridgeFailed);
+        }
+
+        let dispute = EscrowedPaymentDispute {
+            payment_id,
+            raised_by: caller.clone(),
+            reason,
+            raised_at: env.ledger().timestamp(),
+            resolved: false,
+            resolved_at: None,
+            favor_customer: None,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowedPaymentDispute(payment_id), &dispute);
+
+        (EscrowedPaymentDisputed {
+            payment_id,
+            raised_by: caller,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn resolve_escrowed_payment_dispute(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+        favor_customer: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
+        let mut dispute = PaymentContract::get_escrowed_payment_dispute(env.clone(), payment_id)
+            .ok_or(Error::InvalidStatus)?;
+        if dispute.resolved {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        let release_to_merchant = !favor_customer;
+        let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
+        if escrow_client
+            .try_resolve_dispute(&admin, &bridge.escrow_id, &release_to_merchant)
+            .is_err()
+        {
+            return Err(Error::EscrowBridgeFailed);
+        }
+
+        if favor_customer {
+            payment.status = PaymentStatus::Refunded;
+            payment.refunded_amount = payment.amount;
+        } else {
+            payment.status = PaymentStatus::Completed;
+        }
+        dispute.resolved = true;
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        dispute.favor_customer = Some(favor_customer);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowedPaymentDispute(payment_id), &dispute);
+
+        (EscrowedPaymentDisputeResolved {
+            payment_id,
+            favor_customer,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
     pub fn get_escrowed_payment(env: Env, payment_id: u64) -> Result<EscrowedPayment, Error> {
         env.storage()
             .instance()
             .get(&DataKey::EscrowedPayment(payment_id))
             .ok_or(Error::EscrowMappingNotFound)
+    }
+
+    pub fn get_escrowed_payment_dispute(
+        env: Env,
+        payment_id: u64,
+    ) -> Option<EscrowedPaymentDispute> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowedPaymentDispute(payment_id))
+    }
+
+    fn require_no_unresolved_escrowed_payment_dispute(
+        env: &Env,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        if let Some(dispute) = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowedPaymentDispute>(&DataKey::EscrowedPaymentDispute(payment_id))
+        {
+            if !dispute.resolved {
+                return Err(Error::InvalidStatus);
+            }
+        }
+        Ok(())
     }
 
     pub fn update_payment_notes(
@@ -1997,7 +2172,7 @@ impl PaymentContract {
         );
         (PaymentCompleted {
             payment_id,
-            merchant: payment.merchant,
+            merchant: payment.merchant.clone(),
             amount: payment.amount,
         })
         .publish(env);
@@ -5287,7 +5462,7 @@ impl PaymentContract {
             return Err(Error::PaymentProposalExpired);
         }
 
-        if proposal.approvals.len() < proposal.required as usize {
+        if proposal.approvals.len() < proposal.required {
             return Err(Error::InsufficientPaymentApprovals);
         }
 
